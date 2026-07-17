@@ -13,15 +13,7 @@ struct LocalMCPTwoProducerExampleApp: App {
 }
 
 private struct TwoProducerDemoRootView: View {
-    // Constructed in an explicit initializer rather than a property-wrapper
-    // default expression: Swift 6.0's IRGen crashes emitting the backing
-    // initializer for a @StateObject default that expands cross-module
-    // default arguments.
-    @StateObject private var model: TwoProducerDemoViewModel
-
-    init() {
-        _model = StateObject(wrappedValue: TwoProducerDemoViewModel(demo: TwoProducerDemo()))
-    }
+    @StateObject private var model = TwoProducerDemoViewModel()
 
     var body: some View {
         TwoProducerDemoView(model: model)

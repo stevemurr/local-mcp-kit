@@ -40,10 +40,6 @@ let package = Package(
             targets: ["local-mcp"]
         ),
         .executable(
-            name: "local-mcp-two-producers-example",
-            targets: ["local-mcp-two-producers-example"]
-        ),
-        .executable(
             name: "local-mcp-example-producer",
             targets: ["local-mcp-example-producer"]
         ),
@@ -143,12 +139,6 @@ let package = Package(
             path: "Examples/TwoProducers/Sources/Support",
             swiftSettings: strictConcurrencySettings
         ),
-        .executableTarget(
-            name: "local-mcp-two-producers-example",
-            dependencies: ["LocalMCPTwoProducerExampleSupport"],
-            path: "Examples/TwoProducers/Sources/App",
-            swiftSettings: strictConcurrencySettings
-        ),
         .testTarget(
             name: "LocalMCPContractsTests",
             dependencies: ["LocalMCPContracts"],
@@ -232,3 +222,23 @@ let package = Package(
     ],
     swiftLanguageModes: [.v6]
 )
+
+// The SwiftUI demo app crashes the Swift 6.0 compiler while emitting SwiftUI
+// protocol witnesses (signal 6 in IRGen). Every library product keeps the
+// package's Swift 6.0 floor; only this GUI example requires a newer compiler.
+#if compiler(>=6.1)
+package.products.append(
+    .executable(
+        name: "local-mcp-two-producers-example",
+        targets: ["local-mcp-two-producers-example"]
+    )
+)
+package.targets.append(
+    .executableTarget(
+        name: "local-mcp-two-producers-example",
+        dependencies: ["LocalMCPTwoProducerExampleSupport"],
+        path: "Examples/TwoProducers/Sources/App",
+        swiftSettings: strictConcurrencySettings
+    )
+)
+#endif
