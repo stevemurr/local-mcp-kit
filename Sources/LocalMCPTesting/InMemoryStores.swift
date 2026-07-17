@@ -11,15 +11,53 @@ public actor InMemoryProducerGrantStore: ProducerGrantStoring {
 
     private var records: [String: ProducerGrantRecord] = [:]
     private var activeGrantByScope: [Scope: String] = [:]
+    private var pendingGrantByScope: [Scope: String] = [:]
 
     public init() {}
 
+    public func stagePendingGrant(_ record: ProducerGrantRecord) async throws {
+        guard case .pending = record.state else {
+            throw LocalMCPError.credentialStoreFailed
+        }
+        let scope = scope(for: record)
+        if let previousID = pendingGrantByScope[scope], previousID != record.metadata.grantID {
+            records.removeValue(forKey: previousID)
+        }
+        records[record.metadata.grantID] = record
+        pendingGrantByScope[scope] = record.metadata.grantID
+    }
+
+    public func activatePendingGrant(
+        matching digest: CredentialDigest,
+        binding: AuthorizationEndpointBinding?
+    ) async throws -> ProducerGrantRecord? {
+        let matches = records.values.filter { $0.credentialDigest.constantTimeEquals(digest) }
+        guard matches.count <= 1 else { throw LocalMCPError.credentialStoreFailed }
+        guard var record = matches.first else { return nil }
+        if record.state == .active { return record }
+        guard case let .pending(expectedBinding) = record.state,
+              expectedBinding == binding
+        else { return nil }
+
+        let scope = scope(for: record)
+        guard pendingGrantByScope[scope] == record.metadata.grantID else {
+            throw LocalMCPError.credentialStoreFailed
+        }
+        if let previousID = activeGrantByScope[scope], previousID != record.metadata.grantID {
+            records.removeValue(forKey: previousID)
+        }
+        record.state = .active
+        records[record.metadata.grantID] = record
+        pendingGrantByScope.removeValue(forKey: scope)
+        activeGrantByScope[scope] = record.metadata.grantID
+        return record
+    }
+
     public func saveReplacingActiveGrant(_ record: ProducerGrantRecord) async throws {
-        let scope = Scope(
-            producerID: record.metadata.producerID,
-            consumerID: record.metadata.consumer.stableID,
-            installationID: record.metadata.consumer.installationID
-        )
+        guard record.state == .active else {
+            throw LocalMCPError.credentialStoreFailed
+        }
+        let scope = scope(for: record)
         if let previousID = activeGrantByScope[scope], previousID != record.metadata.grantID {
             records.removeValue(forKey: previousID)
         }
@@ -28,22 +66,27 @@ public actor InMemoryProducerGrantStore: ProducerGrantStoring {
     }
 
     public func record(matching digest: CredentialDigest) async throws -> ProducerGrantRecord? {
-        records.values.first { $0.credentialDigest.constantTimeEquals(digest) }
+        let matches = records.values.filter { $0.credentialDigest.constantTimeEquals(digest) }
+        guard matches.count <= 1 else { throw LocalMCPError.credentialStoreFailed }
+        return matches.first
     }
 
     public func record(grantID: String) async throws -> ProducerGrantRecord? {
         records[grantID]
     }
 
+    public func records() async throws -> [ProducerGrantRecord] {
+        records.values.sorted { $0.metadata.grantID < $1.metadata.grantID }
+    }
+
     public func remove(grantID: String) async throws {
         guard let record = records.removeValue(forKey: grantID) else { return }
-        let scope = Scope(
-            producerID: record.metadata.producerID,
-            consumerID: record.metadata.consumer.stableID,
-            installationID: record.metadata.consumer.installationID
-        )
+        let scope = scope(for: record)
         if activeGrantByScope[scope] == grantID {
             activeGrantByScope.removeValue(forKey: scope)
+        }
+        if pendingGrantByScope[scope] == grantID {
+            pendingGrantByScope.removeValue(forKey: scope)
         }
     }
 
@@ -51,6 +94,14 @@ public actor InMemoryProducerGrantStore: ProducerGrantStoring {
 
     public func allRecords() -> [ProducerGrantRecord] {
         records.values.sorted { $0.metadata.grantID < $1.metadata.grantID }
+    }
+
+    private func scope(for record: ProducerGrantRecord) -> Scope {
+        Scope(
+            producerID: record.metadata.producerID,
+            consumerID: record.metadata.consumer.stableID,
+            installationID: record.metadata.consumer.installationID
+        )
     }
 }
 

@@ -561,6 +561,12 @@ struct DiscoveryCatalogTests {
 }
 
 private enum DiscoveryFixture {
+    static let channelBinding = ProducerChannelBinding(
+        publicKey: try! ChannelBindingPublicKey(
+            rawRepresentation: Array(repeating: 0x31, count: 32)
+        )
+    )
+
     static func instanceID(_ value: Int) -> String {
         let suffix = String(value, radix: 16)
         return "00000000-0000-0000-0000-" +
@@ -597,7 +603,8 @@ private enum DiscoveryFixture {
             descriptorURL: try LoopbackEndpoint(
                 port: port,
                 path: "/local-mcp/v1/descriptor.json"
-            )
+            ),
+            channelBinding: channelBinding
         )
     }
 
@@ -605,7 +612,8 @@ private enum DiscoveryFixture {
         ProducerDescriptor(
             instanceID: instance.instanceID,
             server: instance.identity,
-            mcp: MCPDescriptor(endpoint: instance.endpoint.path)
+            mcp: MCPDescriptor(endpoint: instance.endpoint.path),
+            channelBinding: instance.channelBinding
         )
     }
 

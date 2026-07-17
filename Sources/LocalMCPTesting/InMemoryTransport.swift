@@ -116,7 +116,7 @@ public actor InMemoryAdvertiser: LocalMCPAdvertising {
     public func advertise(instance: ProducerInstance, descriptor: ProducerDescriptor) async throws {
         advertiseCalls += 1
         if case .beforePublishing = failure { throw LocalMCPError.advertisementFailed }
-        try await catalog.advertise(instance: instance, descriptor: descriptor)
+        try await catalog.advertiseInProcess(instance: instance, descriptor: descriptor)
         if case .afterPublishing = failure { throw LocalMCPError.advertisementFailed }
     }
 

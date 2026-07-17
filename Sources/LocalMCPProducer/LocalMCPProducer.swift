@@ -2,8 +2,8 @@ import Foundation
 import LocalMCPContracts
 import LocalMCPDiscovery
 
-/// Listener abstraction implemented by the in-memory test transport in Phase 1
-/// and the loopback HTTP listener in Phase 2.
+/// Listener abstraction implemented by the deterministic in-memory transport
+/// and the production numeric-loopback HTTP transport.
 public protocol LocalMCPProducerTransport: Sendable {
     func start(
         endpointPath: String,
@@ -12,6 +12,26 @@ public protocol LocalMCPProducerTransport: Sendable {
 
     /// Idempotently closes all acquired resources and must converge without failure.
     func stop() async
+}
+
+/// Additive transport capability for real listeners that also serve the
+/// versioned descriptor. Existing in-memory/custom transports keep conforming
+/// to `LocalMCPProducerTransport` unchanged.
+public protocol LocalMCPDescriptorServingTransport: LocalMCPProducerTransport {
+    func start(
+        endpointPath: String,
+        descriptorPath: String,
+        descriptor: ProducerDescriptor,
+        service: any LocalMCPService
+    ) async throws -> LoopbackEndpoint
+}
+
+/// A descriptor-serving transport that authenticates one listener epoch with
+/// an in-memory process key. The producer obtains the public half before it
+/// constructs or advertises the descriptor; `stop()` destroys the matching
+/// private context so a later listener epoch cannot silently reuse it.
+public protocol LocalMCPSecureDescriptorServingTransport: LocalMCPDescriptorServingTransport {
+    func prepareProcessChannelBinding() async throws -> ProducerChannelBinding
 }
 
 /// Immutable configuration whose public shape cannot express a non-loopback bind.
@@ -41,7 +61,7 @@ public struct LocalMCPProducerConfiguration: Sendable, Hashable {
     public var isValid: Bool {
         endpointPath == "/mcp" &&
             descriptorPath == "/local-mcp/v1/descriptor.json" &&
-            pairingLifetime > 0 && pairingLifetime <= 600
+            pairingLifetime > 0 && pairingLifetime <= 120
     }
 }
 
@@ -52,8 +72,58 @@ public enum LocalMCPProducerState: Sendable, Hashable {
     case stopping
 }
 
+/// Separates the result observed by concurrent `start()` callers from the
+/// underlying acquisition task. Stopping resolves the shared visible task
+/// immediately while resource convergence can continue tracking the real task.
+private final class ProducerStartAttempt: @unchecked Sendable {
+    private let operation: LocalMCPAsyncOperation<ProducerInstance>
+    private let visibleTask: Task<ProducerInstance, any Error>
+
+    init(
+        operation body: @escaping @Sendable () async throws -> ProducerInstance
+    ) {
+        let operation = LocalMCPAsyncOperation<ProducerInstance>(operation: body)
+        self.operation = operation
+        visibleTask = Task {
+            try await operation.value(cancellationError: LocalMCPError.cancelled)
+        }
+    }
+
+    func value() async throws -> ProducerInstance {
+        try await visibleTask.value
+    }
+
+    func cancel() {
+        operation.cancel(with: LocalMCPError.cancelled)
+    }
+
+    func awaitUnderlyingCompletion() async {
+        await operation.awaitUnderlyingCompletion()
+    }
+}
+
+private actor ProducerStartLaunchGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let current = waiters
+        waiters.removeAll(keepingCapacity: false)
+        for waiter in current { waiter.resume() }
+    }
+}
+
 /// Hosts typed commands and enforces pairing before dispatch.
 public actor LocalMCPProducer: LocalMCPService {
+    private static let shutdownStepTimeout: TimeInterval = 0.25
+
     private let identity: ProducerIdentity
     private let configuration: LocalMCPProducerConfiguration
     private let instanceID: String
@@ -64,11 +134,15 @@ public actor LocalMCPProducer: LocalMCPService {
 
     private var lifecycleState: LocalMCPProducerState = .stopped
     private var lifecycleGeneration: UInt64 = 0
-    private var startTask: Task<ProducerInstance, any Error>?
+    private var startTask: ProducerStartAttempt?
     private var stopTask: Task<Void, Never>?
-    private var activePairings: [UUID: Task<AuthorizationGrant, any Error>] = [:]
-    private var activeCalls: [UUID: Task<CommandResult, any Error>] = [:]
+    /// Completion of every resource operation belonging to an abandoned epoch.
+    /// A later start must await this before touching the shared dependencies.
+    private var resourceConvergence: Task<Void, Never>?
+    private var activePairings: [UUID: LocalMCPAsyncOperation<AuthorizationGrant>] = [:]
+    private var activeCalls: [UUID: LocalMCPAsyncOperation<CommandResult>] = [:]
     private var stateSubscribers: [UUID: AsyncStream<LocalMCPProducerState>.Continuation] = [:]
+    private var listCommandsCheckpointForTesting: (@Sendable () async -> Void)?
 
     public init(
         identity: ProducerIdentity,
@@ -164,27 +238,88 @@ public actor LocalMCPProducer: LocalMCPService {
         let transport = transport
         let advertiser = advertiser
         let registry = registry
+        let authorization = authorization
         let service: any LocalMCPService = self
+        let previousConvergence = resourceConvergence
+        let launchGate = ProducerStartLaunchGate()
 
-        let task = Task<ProducerInstance, any Error> {
-            await registry.seal()
+        let task = ProducerStartAttempt {
+            await launchGate.wait()
             if Task.isCancelled { throw LocalMCPError.cancelled }
-            let endpoint: LoopbackEndpoint
+            if let previousConvergence {
+                await previousConvergence.value
+            }
+            if Task.isCancelled { throw LocalMCPError.cancelled }
+            let channelBinding: ProducerChannelBinding?
             do {
-                endpoint = try await transport.start(
-                    endpointPath: configuration.endpointPath,
-                    service: service
-                )
+                if transport is any LocalMCPDescriptorServingTransport {
+                    guard let secureTransport = transport
+                        as? any LocalMCPSecureDescriptorServingTransport
+                    else { throw LocalMCPError.invalidConfiguration }
+                    channelBinding = try await secureTransport.prepareProcessChannelBinding()
+                } else {
+                    channelBinding = nil
+                }
             } catch is CancellationError {
                 await transport.stop()
                 throw LocalMCPError.cancelled
+            } catch let error as LocalMCPError {
+                await transport.stop()
+                throw error
+            } catch {
+                await transport.stop()
+                throw LocalMCPError.invalidConfiguration
+            }
+            let endpointBinding = channelBinding.map {
+                AuthorizationEndpointBinding(instanceID: instanceID, channelBinding: $0)
+            }
+            do {
+                try await authorization.setEndpointBinding(endpointBinding)
+            } catch {
+                await transport.stop()
+                throw LocalMCPError.invalidConfiguration
+            }
+            let descriptor = ProducerDescriptor(
+                instanceID: instanceID,
+                server: identity,
+                mcp: MCPDescriptor(endpoint: configuration.endpointPath),
+                channelBinding: channelBinding
+            )
+            let endpoint: LoopbackEndpoint
+            do {
+                if let descriptorTransport = transport as? any LocalMCPDescriptorServingTransport {
+                    endpoint = try await descriptorTransport.start(
+                        endpointPath: configuration.endpointPath,
+                        descriptorPath: configuration.descriptorPath,
+                        descriptor: descriptor,
+                        service: service
+                    )
+                } else {
+                    endpoint = try await transport.start(
+                        endpointPath: configuration.endpointPath,
+                        service: service
+                    )
+                }
+            } catch is CancellationError {
+                await authorization.clearEndpointBinding(ifMatching: endpointBinding)
+                await transport.stop()
+                throw LocalMCPError.cancelled
+            } catch let error as LocalMCPError where error == .invalidConfiguration {
+                // Transport implementations validate their own public knobs
+                // before acquisition. Preserve that stable configuration error
+                // instead of misreporting it as an operating-system bind failure.
+                await authorization.clearEndpointBinding(ifMatching: endpointBinding)
+                await transport.stop()
+                throw error
             } catch {
                 // A listener may have acquired resources before reporting failure.
+                await authorization.clearEndpointBinding(ifMatching: endpointBinding)
                 await transport.stop()
                 throw LocalMCPError.bindFailed
             }
 
             guard endpoint.path == configuration.endpointPath else {
+                await authorization.clearEndpointBinding(ifMatching: endpointBinding)
                 await transport.stop()
                 throw LocalMCPError.bindFailed
             }
@@ -199,33 +334,48 @@ public actor LocalMCPProducer: LocalMCPService {
                     identity: identity,
                     instanceID: instanceID,
                     endpoint: endpoint,
-                    descriptorURL: descriptorEndpoint
-                )
-                let descriptor = ProducerDescriptor(
-                    instanceID: instanceID,
-                    server: identity,
-                    mcp: MCPDescriptor(endpoint: configuration.endpointPath)
+                    descriptorURL: descriptorEndpoint,
+                    channelBinding: channelBinding
                 )
                 try await advertiser.advertise(instance: instance, descriptor: descriptor)
                 try Task.checkCancellation()
                 return instance
             } catch is CancellationError {
                 await advertiser.withdraw(instanceID: instanceID)
+                await authorization.clearEndpointBinding(ifMatching: endpointBinding)
                 await transport.stop()
                 throw LocalMCPError.cancelled
             } catch let error as LocalMCPError where error == .invalidConfiguration {
                 await advertiser.withdraw(instanceID: instanceID)
+                await authorization.clearEndpointBinding(ifMatching: endpointBinding)
                 await transport.stop()
                 throw error
             } catch {
                 // Defensively withdraw even when the backend threw after publishing.
                 await advertiser.withdraw(instanceID: instanceID)
+                await authorization.clearEndpointBinding(ifMatching: endpointBinding)
                 await transport.stop()
                 throw LocalMCPError.advertisementFailed
             }
         }
         startTask = task
         publish(.starting)
+        // Seal from the lifecycle actor before releasing unstructured resource
+        // acquisition. A cancelled/abandoned task can therefore never reseal a
+        // registry after stop has visibly returned it to the stopped state.
+        await registry.seal()
+        let ownsLifecycle = generation == lifecycleGeneration
+            && startTask === task
+            && lifecycleState == .starting
+        await launchGate.open()
+        guard ownsLifecycle else {
+            // A newer run owns sealed state; only a visibly stopped producer
+            // should be unsealed by this stale start continuation.
+            if lifecycleState == .stopped {
+                await registry.unseal()
+            }
+            throw LocalMCPError.cancelled
+        }
         try await finishStart(task, generation: generation)
     }
 
@@ -240,30 +390,66 @@ public actor LocalMCPProducer: LocalMCPService {
 
         lifecycleGeneration &+= 1
         publish(.stopping)
+        try? await authorization.setEndpointBinding(nil)
         let pendingStart = startTask
         pendingStart?.cancel()
         startTask = nil
         let pendingPairings = Array(activePairings.values)
         let pendingCalls = Array(activeCalls.values)
-        pendingPairings.forEach { $0.cancel() }
-        pendingCalls.forEach { $0.cancel() }
+        activePairings.removeAll(keepingCapacity: false)
+        activeCalls.removeAll(keepingCapacity: false)
+        pendingPairings.forEach { $0.cancel(with: LocalMCPError.cancelled) }
+        pendingCalls.forEach { $0.cancel(with: LocalMCPError.cancelled) }
 
         let advertiser = advertiser
         let transport = transport
+        let authorization = authorization
         let instanceID = instanceID
-        let cleanup = Task<Void, Never> {
+        let withdraw = LocalMCPAsyncOperation<Void>(
+            timeoutAfter: Self.shutdownStepTimeout,
+            timeoutError: LocalMCPError.cancelled
+        ) {
             await advertiser.withdraw(instanceID: instanceID)
-            // Closing acceptance first also unblocks a listener that is still
-            // suspended inside startup.
-            await transport.stop()
-            for task in pendingPairings { _ = try? await task.value }
-            for task in pendingCalls { _ = try? await task.value }
-            _ = try? await pendingStart?.value
-            // A cancellation-insensitive backend may have completed after the
-            // first cleanup pass. A second pass makes shutdown convergent.
-            await advertiser.withdraw(instanceID: instanceID)
+        }
+        let visibleWithdraw = Task<Void, Never> {
+            _ = try? await withdraw.value(cancellationError: LocalMCPError.cancelled)
+        }
+
+        // Preserve withdraw-before-close ordering even when withdrawal ignores
+        // cancellation. The close step receives its own bounded grace period
+        // after the visible withdrawal result has resolved.
+        let close = LocalMCPAsyncOperation<Void>(
+            timeout: {
+                await visibleWithdraw.value
+                try await Task.sleep(
+                    nanoseconds: UInt64(Self.shutdownStepTimeout * 1_000_000_000)
+                )
+            },
+            timeoutError: LocalMCPError.cancelled
+        ) {
+            await visibleWithdraw.value
             await transport.stop()
         }
+        let visibleClose = Task<Void, Never> {
+            _ = try? await close.value(cancellationError: LocalMCPError.cancelled)
+        }
+        let cleanup = Task<Void, Never> {
+            await visibleWithdraw.value
+            await visibleClose.value
+        }
+
+        // Keep every losing operation owned by this epoch. A later start waits
+        // for this task, including a final cleanup after a startup that acquired
+        // resources late. No old stop/withdraw can therefore overlap a new run.
+        let convergence = Task<Void, Never> {
+            await withdraw.awaitUnderlyingCompletion()
+            await close.awaitUnderlyingCompletion()
+            await pendingStart?.awaitUnderlyingCompletion()
+            await advertiser.withdraw(instanceID: instanceID)
+            await transport.stop()
+            try? await authorization.setEndpointBinding(nil)
+        }
+        resourceConvergence = convergence
         stopTask = cleanup
         await cleanup.value
         await finishStoppingIfNeeded()
@@ -277,23 +463,47 @@ public actor LocalMCPProducer: LocalMCPService {
         try await authorization.record(grantID: grantID)
     }
 
+    /// Lists persisted producer-side grants in deterministic grant-ID order.
+    /// Records contain credential digests only; bearer credentials are never exposed.
+    public func grantRecords() async throws -> [ProducerGrantRecord] {
+        try await authorization.records()
+    }
+
+    func setListCommandsCheckpointForTesting(
+        _ checkpoint: (@Sendable () async -> Void)?
+    ) {
+        listCommandsCheckpointForTesting = checkpoint
+    }
+
     // MARK: LocalMCPService
 
     public func requestPairing(_ request: PairingRequest) async throws -> AuthorizationGrant {
         guard case .running = lifecycleState else { throw LocalMCPError.producerUnavailable }
         let generation = lifecycleGeneration
         let operationID = UUID()
-        let task = Task<AuthorizationGrant, any Error> { [authorization] in
+        let operation = LocalMCPAsyncOperation<AuthorizationGrant> { [authorization] in
             try await authorization.pair(request)
         }
-        activePairings[operationID] = task
-        defer { activePairings.removeValue(forKey: operationID) }
-        let grant = try await task.value
+        activePairings[operationID] = operation
+        let grant: AuthorizationGrant
+        do {
+            grant = try await operation.value(cancellationError: LocalMCPError.cancelled)
+            activePairings.removeValue(forKey: operationID)
+        } catch {
+            activePairings.removeValue(forKey: operationID)
+            throw error
+        }
         guard generation == lifecycleGeneration, case .running = lifecycleState else {
             try? await authorization.revoke(grantID: grant.metadata.grantID)
             throw LocalMCPError.producerUnavailable
         }
         return grant
+    }
+
+    public func authenticate(credential: AuthorizationCredential?) async throws {
+        try ensureRunning()
+        _ = try await authorization.authenticate(credential)
+        try ensureRunning()
     }
 
     public func initialize(
@@ -315,9 +525,18 @@ public actor LocalMCPProducer: LocalMCPService {
 
     public func listCommands(credential: AuthorizationCredential?) async throws -> [CommandDefinition] {
         try ensureRunning()
+        let generation = lifecycleGeneration
         _ = try await authorization.authenticate(credential)
         try ensureRunning()
-        return await registry.definitions()
+        if let checkpoint = listCommandsCheckpointForTesting {
+            listCommandsCheckpointForTesting = nil
+            await checkpoint()
+        }
+        let definitions = await registry.definitions()
+        guard generation == lifecycleGeneration, case .running = lifecycleState else {
+            throw LocalMCPError.producerUnavailable
+        }
+        return definitions
     }
 
     public func initialized(credential: AuthorizationCredential?) async throws {
@@ -331,6 +550,7 @@ public actor LocalMCPProducer: LocalMCPService {
         credential: AuthorizationCredential?
     ) async throws -> CommandResult {
         try ensureRunning()
+        let generation = lifecycleGeneration
         let grant = try await authorization.authenticate(credential)
         try ensureRunning()
         let context = CommandContext(
@@ -340,22 +560,31 @@ public actor LocalMCPProducer: LocalMCPService {
             deadline: request.deadline
         )
         let operationID = UUID()
-        let task = Task<CommandResult, any Error> { [registry] in
+        let operation = LocalMCPAsyncOperation<CommandResult> { [registry] in
             try await registry.invoke(request, context: context)
         }
-        activeCalls[operationID] = task
-        defer { activeCalls.removeValue(forKey: operationID) }
-        return try await task.value
+        activeCalls[operationID] = operation
+        do {
+            let result = try await operation.value(cancellationError: LocalMCPError.cancelled)
+            activeCalls.removeValue(forKey: operationID)
+            guard generation == lifecycleGeneration, case .running = lifecycleState else {
+                throw LocalMCPError.producerUnavailable
+            }
+            return result
+        } catch {
+            activeCalls.removeValue(forKey: operationID)
+            throw error
+        }
     }
 
     // MARK: Lifecycle internals
 
     private func finishStart(
-        _ task: Task<ProducerInstance, any Error>,
+        _ task: ProducerStartAttempt,
         generation: UInt64
     ) async throws {
         do {
-            let instance = try await task.value
+            let instance = try await task.value()
             guard generation == lifecycleGeneration else {
                 throw LocalMCPError.cancelled
             }

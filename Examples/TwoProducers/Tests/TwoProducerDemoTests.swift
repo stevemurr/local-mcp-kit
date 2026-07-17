@@ -368,8 +368,20 @@ struct TwoProducerDemoTests {
             #expect(failed.producer(kind)?.tools.isEmpty == true)
             let diagnostics = await demo.diagnostics()
             #expect(diagnostics.consumerGrantCount == 0)
-            #expect(diagnostics.producerGrantCounts[kind] == 1)
-            #expect(diagnostics.revokedProducerGrantCounts[kind] == 1)
+            switch failure {
+            case .initialization:
+                // The candidate never authenticated, so safe rotation removes
+                // the unactivated pending grant instead of revoking it.
+                #expect(diagnostics.producerGrantCounts[kind] == 0)
+                #expect(diagnostics.revokedProducerGrantCounts[kind] == 0)
+            case .toolListing:
+                // Initialization activated the candidate, so rollback keeps a
+                // revoked record rather than deleting an activated credential.
+                #expect(diagnostics.producerGrantCounts[kind] == 1)
+                #expect(diagnostics.revokedProducerGrantCounts[kind] == 1)
+            case .none:
+                Issue.record("A failure point is required")
+            }
             await expectDemoError(.pairingRequired) {
                 if kind == .greeter {
                     try await demo.sendGreeting(to: "blocked")
@@ -384,6 +396,37 @@ struct TwoProducerDemoTests {
             #expect(repairedDiagnostics.consumerGrantCount == 1)
             #expect(repairedDiagnostics.producerGrantCounts[kind] == 1)
             #expect(repairedDiagnostics.revokedProducerGrantCounts[kind] == 0)
+        }
+    }
+
+    @Test("A failed rotation candidate is removed without disturbing the active grant")
+    func rotationFailurePreservesActiveGrant() async throws {
+        let demo = TwoProducerDemo()
+        try await withRunningDemo(demo) { demo in
+            _ = try await demo.pair(with: .greeter)
+            let paired = await demo.diagnostics()
+            #expect(paired.consumerGrantCount == 1)
+            #expect(paired.producerGrantCounts[.greeter] == 1)
+            #expect(paired.revokedProducerGrantCounts[.greeter] == 0)
+
+            await demo.schedulePairingFinalizationFailure(.initialization(.greeter))
+            await expectDemoError(.commandFailed) {
+                try await demo.pair(with: .greeter)
+            }
+
+            // The failed rotation candidate is cleaned up while the previously
+            // activated producer grant record survives untouched.
+            let diagnostics = await demo.diagnostics()
+            #expect(diagnostics.producerGrantCounts[.greeter] == 1)
+            #expect(diagnostics.revokedProducerGrantCounts[.greeter] == 0)
+            #expect(diagnostics.consumerGrantCount == 0)
+
+            let repaired = try await demo.pair(with: .greeter)
+            #expect(repaired.producer(.greeter)?.status == .paired)
+            let repairedDiagnostics = await demo.diagnostics()
+            #expect(repairedDiagnostics.consumerGrantCount == 1)
+            #expect(repairedDiagnostics.producerGrantCounts[.greeter] == 1)
+            #expect(repairedDiagnostics.revokedProducerGrantCounts[.greeter] == 0)
         }
     }
 

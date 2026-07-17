@@ -27,16 +27,13 @@ V1 considers these adversaries and failures:
 
 V1 does not claim to protect against root, a process with debugger/task-port access to either app, a compromised producer/consumer process, malicious code running inside the host app, or physical access to an unlocked account. Code-signing attestation is not part of V1 pairing; the displayed consumer identity is a user-correlated claim.
 
-## Phase 4 decision gate: producer endpoint authenticity
+## V1 decision: producer endpoint authenticity
 
 The stable producer ID, DNS-SD record, descriptor, and listener port are unauthenticated claims. If a consumer sends a persisted bearer token to a newly advertised instance solely because its stable ID matches, a hostile same-user process can advertise that ID, receive the token, and then impersonate or relay to the real producer. Host/Origin validation, LocalOnly DNS-SD, and checking whether the endpoint “accepts” the token do not prevent this disclosure—the impersonating endpoint sees the credential before any such result is trustworthy.
 
-This does not block Phase 1's in-memory grant model. It is a release gate for Phase 4 network persistence. Before a network-capable build automatically reuses a grant across producer instances, an ADR must either:
+V1 resolves this boundary conservatively: stored grant metadata may be displayed or located by stable ID, but LocalMCPKit never automatically sends its bearer to a changed producer instance. A consumer must complete fresh explicit producer-side approval/rebinding before a replacement instance receives a bearer. This avoids disclosing a reusable credential to a same-user impersonator without inventing a code-signing or certificate-attestation protocol.
 
-- add a cryptographic producer binding established during approved pairing and verify it before sending the bearer; or
-- explicitly narrow the threat model, document the residual same-user impersonation risk, and require a fresh producer-side approval when the instance changes.
-
-This document intentionally does not choose or invent that later protocol. Until the ADR is resolved, stable ID matching may locate credential metadata but MUST NOT by itself authorize sending a stored bearer to a replacement instance.
+A future version may add a cryptographic producer binding established during approved pairing and verified before bearer disclosure. That would require a versioned protocol/ADR and compatibility tests; stable-ID matching alone will remain insufficient.
 
 ## Assets
 
@@ -80,7 +77,7 @@ The request-context validator runs before authentication, route parsing, or body
 
 ### Host / authority
 
-For a listener bound to port `P`, the only accepted HTTP/1.1 `Host` or HTTP/2 `:authority` value is the exact ASCII authority:
+V1 accepts HTTP/1.1 only. For a listener bound to port `P`, the only accepted `Host` value is the exact ASCII authority:
 
 ```text
 127.0.0.1:P
@@ -113,21 +110,27 @@ The network producer applies checks in this order:
 1. Confirm the listener accepted the connection on IPv4 loopback.
 2. Enforce header count/byte/time limits.
 3. Validate exact Host/authority and Origin policy.
-4. Select a known method and route and enforce its body limit.
-5. For `/mcp`, parse the bearer syntax and validate the token/grant.
-6. Decode the minimum transport/MCP envelope and negotiate/validate the protocol version.
-7. Decode and validate command input against the registered schema. Phase 1 provides typed structural decoding; general constraint evaluation is required when the Phase 2 network adapter is added.
-8. Create a package-owned `CommandContext` from the authenticated grant, deadline, cancellation signal, and generated request ID.
-9. Invoke the app handler.
-10. Encode a bounded, sanitized response.
+4. Select a known method and route and enforce its body limit (the outer encrypted envelope bound for `/mcp`).
+5. For `/mcp`, require the exact secure media type, then authenticate and decrypt the sealed envelope. An undecryptable, tampered, malformed, or wrongly bound envelope is an empty 400 that carries no credential information.
+6. Consume the request's replay coordinate (one-shot initialize message ID, or the session's sequence window) before any suspended work.
+7. Parse the logical bearer from the decrypted headers and validate the token/grant.
+8. Decode the minimum MCP envelope, enforce the decrypted 1 MiB body limit, and negotiate/validate the protocol version.
+9. Decode and validate command input against the bounded supported JSON Schema assertions before typed dispatch; V1 rejects backtracking regular-expression `pattern` assertions.
+10. Create a package-owned `CommandContext` from the authenticated grant, deadline, cancellation signal, and generated request ID.
+11. Invoke the app handler.
+12. Encode a bounded, sanitized response and seal it to the request's response key.
 
-Steps 6–10 cannot run for an unauthorized MCP request. Tests prove this with a handler invocation counter, not only an HTTP status assertion.
+Steps 8–12 cannot run for an unauthorized MCP request. Tests prove this with a handler invocation counter, not only an HTTP status assertion.
 
-Malformed or multiple `Authorization` headers fail. The accepted form is one `Authorization: Bearer <token>` header. Network responses use a generic unauthorized result for missing, wrong, expired, rotated, and revoked tokens so they do not become a grant-status oracle. A consumer may map the rejection to a more specific local error only when its own credential metadata establishes that context.
+The bearer travels only inside the sealed envelope as one logical `authorization: Bearer <token>` header; a plaintext outer `Authorization` header invalidates the whole envelope. Malformed or duplicate logical authorization headers fail. Network responses use a generic unauthorized result for missing, wrong, expired, rotated, and revoked tokens so they do not become a grant-status oracle. A rolled-back, never-activated pairing candidate is removed rather than tombstoned, so its credential is indistinguishable from one that never existed. A consumer may map the rejection to a more specific local error only when its own credential metadata establishes that context.
+
+The outer `/mcp` request is always `POST` with `Accept` and `Content-Type` exactly `application/vnd.localmcp.secure+json`. The decrypted logical request uses `Content-Type: application/json` and advertises both `application/json` and `text/event-stream` in its logical `Accept`, matching the MCP 2025-11-25 lifecycle carried inside the envelope. V1 responds with JSON rather than opening an SSE stream. `initialize` creates a session bound to the credential digest; later requests require the exact negotiated protocol version and logical `mcp-session-id`, plus a fresh sealed sequence number inside the session's 64-message anti-replay window. Sessions are bounded and a valid authenticated logical `DELETE` terminates one. A session cannot be reused with a different bearer.
+
+Each active `tools/call` is keyed by session and JSON-RPC request ID. `notifications/cancelled`, HTTP client disconnect, consumer task cancellation, handler deadline, and producer stop cancel the corresponding work. Cancelled work cannot later publish a successful response. Listener connection tasks and session/call tables are released on shutdown.
 
 ## Pairing and grants
 
-The wire exchange, verification-code derivation, 120-second pending lifetime, and request limits are defined in [the discovery profile](../Spec/local-discovery-v1.md#pairing-exchange-phase-4-wire-baseline). Phase 1 implements the same logical states in memory; Phase 4 implements the network route.
+The wire exchange, verification-code derivation, 120-second pending lifetime, and request limits are defined in [the discovery profile](../Spec/local-discovery-v1.md#pairing-exchange). Both the deterministic in-memory state machine and production network route implement those logical states.
 
 Pairing approval is producer-side and one-shot. The host callback receives display identity plus a short code and returns allow/deny for one pending request. It cannot approve an arbitrary stable ID globally. Closing the request, expiry, producer shutdown, or callback cancellation destroys the pending state.
 
@@ -159,7 +162,7 @@ Revocation updates durable producer state before reporting success and invalidat
 
 Network rotation is a new explicitly approved pairing request for the same producer/consumer installation tuple. Approval creates a new random token, returns the plaintext once on that pending request, and atomically replaces the old digest. Failure leaves either the old grant valid or the new grant valid, never both accidentally and never neither without an explicit operator revocation. There is no standalone token retrieval endpoint.
 
-Producer restart reloads grants from Keychain. Consumer restart reloads its own token. Loading those records does not authenticate a replacement network instance; reuse follows the Phase 4 endpoint-authenticity decision above.
+Producer restart reloads grants from Keychain. Consumer restart can read its own token as operator/rebinding metadata. Loading those records does not authenticate a replacement network instance, and the consumer never sends the bearer automatically after an instance change.
 
 ## Resource limits
 
@@ -172,10 +175,10 @@ The initial network defaults and hard ceilings are intentionally conservative an
 | Pairing request body | 8 KiB maximum |
 | MCP HTTP request body | 1 MiB maximum |
 | Decoded command arguments | 256 KiB default encoded-size budget; a command may declare a smaller limit |
-| Handler execution | 30-second default deadline; configurable from 1 through 300 seconds |
+| Handler execution | 30-second default deadline; configurable from 0.05 through 300 seconds |
 | Pending pairing | 120 seconds, at most 3 concurrent, at most 5 starts per rolling minute |
 
-These are package limits in addition to schema constraints. A body rejected on declared length is not read; chunked bodies stop once the limit is crossed. Responses are bounded before allocation where possible. The listener applies an overall concurrency/backpressure policy in Phase 2 rather than starting unbounded tasks.
+These are package limits in addition to schema constraints. A body rejected on declared length is not read; chunked bodies stop once the limit is crossed. Responses are bounded before allocation where possible. The listener caps active connections at 64 and sessions at 128 by default, rejects excess work with bounded responses, and does not start unbounded tasks.
 
 Cancellation propagates from disconnected requests, explicit MCP cancellation, consumer cancellation, producer stop, and deadline expiry. A cancelled handler cannot later publish a response as if successful.
 
@@ -190,6 +193,10 @@ An incompatible descriptor is shown separately from an offline producer. This re
 ## Command safety
 
 Registration requires an explicit JSON input schema and safety annotations. Schemas and annotations help consumers present and filter tools, but they do not enforce host-app data authorization by themselves.
+
+Omitted annotations remain conservative: destructive and open-world default to
+true. A producer must explicitly assert false only when its implementation and
+data policy justify that claim.
 
 Host handlers must apply the app's existing access controls and privacy policy. They receive a sanitized consumer/grant identity, cancellation, deadline, and trace ID. They do not receive the bearer token. The generic package never requests filesystem access or imports File Search models.
 

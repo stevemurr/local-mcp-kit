@@ -59,8 +59,8 @@ Scripts/run-ui-tests.sh
 
 The host needs Tart, XcodeGen, SSH, and rsync. The golden image must contain macOS, Xcode, and Remote Login with the selected key authorized. `TART_HOME` can point Tart at a non-default image store. Apple licensing prevents the repository from distributing a prepared macOS image.
 
-## Current boundary
+## Boundary
 
-This is an honest Phase 1 example: discovery, transport, and credential stores are in memory. It does not claim to exercise sockets, HTTP wire encoding, Bonjour, Keychain, or separate processes. Those implementations replace the injected boundaries in later phases without changing the producer/consumer orchestration demonstrated here.
+This example deliberately keeps discovery, transport, and credential stores in memory so one window can show one logical consumer and both producers deterministically. It does not claim that this target exercises sockets, HTTP wire encoding, Bonjour, Keychain, or separate processes. Those production backends ship in the library and are exercised by the [separate-process example](../SeparateProcess/README.md); swapping the injected boundaries does not change the orchestration demonstrated here.
 
 Pairing approval is automatic only to keep both logical apps visible in one small window. Production code must replace `DemoAutoPairingApprover` with a producer-owned user approval UI. The demo does not retain verification codes or expose credentials in snapshots or events.

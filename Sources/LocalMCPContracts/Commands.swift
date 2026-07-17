@@ -10,8 +10,8 @@ public struct CommandAnnotations: Codable, Sendable, Hashable {
     public init(
         readOnly: Bool = false,
         idempotent: Bool = false,
-        destructive: Bool = false,
-        openWorld: Bool = false
+        destructive: Bool = true,
+        openWorld: Bool = true
     ) {
         self.readOnly = readOnly
         self.idempotent = idempotent
@@ -49,13 +49,19 @@ public struct CommandDefinition: Codable, Sendable, Hashable {
         guard Self.isValidName(name),
               !description.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               description.utf8.count <= 1_024,
-              title.map({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.utf8.count <= 256 }) ?? true,
+              !LocalMCPValidation.containsUnsafeTextScalar(description),
+              title.map({
+                  !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                      $0.utf8.count <= 256 &&
+                      !LocalMCPValidation.containsUnsafeTextScalar($0)
+              }) ?? true,
               case .object = inputSchema,
+              inputSchema["type"] == .string("object"),
               inputSchema.isValidJSON
         else { return false }
 
         if let outputSchema, case .object = outputSchema {
-            return outputSchema.isValidJSON
+            return outputSchema["type"] == .string("object") && outputSchema.isValidJSON
         }
         return outputSchema == nil
     }
@@ -106,7 +112,9 @@ public struct CommandResult: Codable, Sendable, Hashable {
         _ value: Value,
         text: String? = nil
     ) throws -> CommandResult {
-        CommandResult(structuredContent: try JSONValue.encode(value), text: text)
+        let content = try JSONValue.encode(value)
+        guard case .object = content else { throw LocalMCPError.commandFailed }
+        return CommandResult(structuredContent: content, text: text)
     }
 
     public static func text(_ value: String) -> CommandResult {

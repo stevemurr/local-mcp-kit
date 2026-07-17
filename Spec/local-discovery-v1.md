@@ -1,6 +1,6 @@
 # LocalMCPKit local discovery profile, version 1
 
-Status: normative V1 discovery profile; the pairing exchange is a Phase 4 baseline and is not a Phase 1 network requirement. Network reuse of persisted grants is subject to the producer-authenticity decision gate in [the security model](../Docs/security.md#phase-4-decision-gate-producer-endpoint-authenticity).
+Status: normative and implemented V1 discovery and pairing profile. Persisted grants are never sent automatically to a replacement instance; see [the producer-authenticity decision](../Docs/security.md#v1-decision-producer-endpoint-authenticity).
 
 This document defines how a LocalMCPKit producer advertises a live, same-Mac MCP endpoint and how a consumer turns that advertisement into an untrusted producer instance. It also reserves the V1 descriptor and pairing HTTP contracts. It does not make discovery proof of identity or permission to invoke a tool.
 
@@ -16,12 +16,17 @@ The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** ar
 | MCP endpoint | `/mcp` |
 | Descriptor endpoint | `/local-mcp/v1/descriptor.json` |
 | Pairing endpoint | `/local-mcp/v1/pairing-requests` |
-| Authentication mode | `pair` in TXT; `pairing` in JSON |
-| MCP transport | `streamable-http` |
+| Authentication mode | `pair-channel` in TXT; `pairing-channel` in JSON |
+| MCP transport | `localmcp-secure-http` |
+| Channel-binding suite | `x25519-hkdf-sha256-chacha20poly1305-v1` |
+| Secure envelope media type | `application/vnd.localmcp.secure+json` |
+| Secure envelope profile | `localmcp-secure-v1` |
 | Initial MCP protocol version | `2025-11-25` |
 | Address constructed by consumers | IPv4 loopback, `127.0.0.1` |
 
 These constants are centralized by the implementation. In particular, `_mcp._tcp` MUST NOT be used because `mcp` is already assigned by IANA to another protocol.
+
+`localmcp-secure-http` is a LocalMCP transport extension, not generic plaintext MCP Streamable HTTP. The producer runs the complete MCP 2025-11-25 lifecycle — `initialize`, `notifications/initialized`, `tools/list`, `tools/call`, session management, and cancellation — inside an encrypted loopback envelope described in [the secure MCP envelope section](#secure-mcp-envelope). The bearer credential, `Mcp-Session-Id`, `MCP-Protocol-Version`, and the JSON-RPC message never appear on the outer HTTP wire.
 
 ## Security model
 
@@ -56,7 +61,7 @@ v=1
 id=com.example.notes
 path=/mcp
 desc=/local-mcp/v1/descriptor.json
-auth=pair
+auth=pair-channel
 ```
 
 Rules:
@@ -66,7 +71,7 @@ Rules:
 - `id` MUST satisfy the stable identifier rules below.
 - `path` MUST be `/mcp` in V1.
 - `desc` MUST be `/local-mcp/v1/descriptor.json` in V1. It names this profile's descriptor, not an experimental MCP Server Card or Registry manifest.
-- `auth` MUST be `pair` in V1.
+- `auth` MUST be `pair-channel` in V1.
 - A producer SHOULD emit only the five required keys. The complete encoded TXT record MUST NOT exceed 512 bytes.
 - Readers MUST ignore unknown keys so additive profile metadata remains possible.
 - A missing, duplicate, malformed, or unsupported required value makes the record incompatible. It MUST NOT become an available producer instance.
@@ -113,13 +118,17 @@ The V1 descriptor is UTF-8 JSON:
     "version": "1.0.0"
   },
   "mcp": {
-    "transport": "streamable-http",
+    "transport": "localmcp-secure-http",
     "endpoint": "/mcp",
     "protocolVersions": ["2025-11-25"],
-    "authentication": "pairing"
+    "authentication": "pairing-channel"
   },
   "capabilities": {
     "tools": true
+  },
+  "channelBinding": {
+    "suite": "x25519-hkdf-sha256-chacha20poly1305-v1",
+    "publicKey": "base64url-encoded-32-byte-x25519-public-key"
   }
 }
 ```
@@ -133,11 +142,13 @@ The V1 descriptor is UTF-8 JSON:
 | `/server/id` | Required stable producer identifier; must equal TXT `id`. |
 | `/server/name` | Required nonempty display name, 1–128 Unicode scalar values, with no control characters. Presentation-only. |
 | `/server/version` | Required nonempty app version string, at most 64 Unicode scalar values. It is descriptive, not a compatibility input. |
-| `/mcp/transport` | Required string; exact value `streamable-http`. |
+| `/mcp/transport` | Required string; exact value `localmcp-secure-http`. |
 | `/mcp/endpoint` | Required string; exact value `/mcp` and equal to TXT `path`. |
 | `/mcp/protocolVersions` | Required nonempty array of unique protocol-version strings. V1 initially emits `2025-11-25`. |
-| `/mcp/authentication` | Required string; exact value `pairing`, corresponding to TXT `auth=pair`. |
+| `/mcp/authentication` | Required string; exact value `pairing-channel`, corresponding to TXT `auth=pair-channel`. |
 | `/capabilities/tools` | Required Boolean; must be `true` for a V1 producer. |
+| `/channelBinding/suite` | Required string; exact value `x25519-hkdf-sha256-chacha20poly1305-v1`. An unknown suite makes the descriptor incompatible. |
+| `/channelBinding/publicKey` | Required canonical unpadded base64url encoding of the producer's 32-byte X25519 process public key, generated fresh for each process launch. |
 
 The top-level JSON value and each named object MUST be objects, not `null` or another JSON kind. Readers MUST ignore unknown object members at every level. A new optional member does not require a schema version change. Removing a required member, changing its meaning or JSON type, or changing the meaning of an existing enum value requires a new `schemaVersion` and compatibility tests.
 
@@ -152,7 +163,7 @@ A consumer performs these checks before emitting an available instance:
 3. Fetch the descriptor from the constructed loopback URL without redirects.
 4. Decode required fields while ignoring unknown members.
 5. Require descriptor schema version `1`, stable ID equality with TXT, and endpoint/authentication agreement with TXT.
-6. Require `streamable-http`, tools support, and at least one exact MCP protocol-version intersection with the consumer.
+6. Require `localmcp-secure-http`, tools support, a supported channel-binding suite with a well-formed 32-byte public key, and at least one exact MCP protocol-version intersection with the consumer.
 7. Validate the random per-launch instance ID.
 
 An implementation MUST distinguish “incompatible” from “offline/unavailable” in its observable consumer state or diagnostic stream. It MUST NOT silently downgrade an incompatible record into a partially populated producer.
@@ -169,13 +180,13 @@ After successful validation, consumers deduplicate by descriptor `instanceId`, n
 - A process restart has a new `instanceId` and therefore appears as removal of the old instance plus addition of the new one, even when the stable producer ID is unchanged.
 - Repeated equivalent DNS-SD callbacks produce no event.
 
-Event ordering for a single browser is serialized. Cancellation stops browsing and releases DNS-SD resources. A stored grant is never sent to a restarted or materially changed instance solely because its stable ID matches; the Phase 4 producer-authenticity gate must be resolved before persisted bearer reuse is enabled.
+Event ordering for a single browser is serialized. Cancellation stops browsing and releases DNS-SD resources. A stored grant is never sent to a restarted or materially changed instance solely because its stable ID matches; V1 requires fresh explicit producer-side approval/rebinding before the replacement receives a bearer.
 
 The public event source is a broadcast, not a work queue. Each active subscriber receives its own copy of transitions. A late subscriber first receives the browser's current instances, including explicit incompatibility state, as deterministic `added` events ordered by instance ID, then live transitions. Cancelling one subscriber removes only that subscription and does not stop browsing or another subscriber. Implementations use a bounded per-subscriber buffer; overflow terminates that subscription so it can resubscribe and replay a converged snapshot instead of silently continuing after a gap.
 
-## Pairing exchange (Phase 4 wire baseline)
+## Pairing exchange
 
-No network pairing endpoint is required in the Phase 1 in-memory slice. When network pairing is implemented, V1 uses the separate `/local-mcp/v1/pairing-requests` route described here; it does not multiplex pairing messages into `/mcp`.
+V1 implements pairing on the separate `/local-mcp/v1/pairing-requests` route described here; it does not multiplex pairing messages into `/mcp`. The in-memory transport implements the same logical state transitions without HTTP.
 
 ### Consumer identity
 
@@ -188,9 +199,11 @@ A consumer identity has:
 
 Grants are bound to the tuple `(producer stable ID, consumer stable ID, consumer installation ID)`. Claimed identity is shown to the user but is not code-signing attestation.
 
-### Request and human verification
+### Commitment → challenge → reveal exchange
 
-The consumer generates 32 random bytes with a cryptographically secure random generator, encodes them as unpadded base64url, and sends one `POST /local-mcp/v1/pairing-requests` request:
+V1 pairing over HTTP is a channel-bound two-request exchange. The consumer commits to a secret before the producer contributes its nonce, then reveals the secret to finalize a shared transcript. The transcript binds the consumer's ephemeral key, the producer's process key, the instance identity, the endpoint, and both nonces, so an active relay cannot splice its own key material into either leg.
+
+**Leg 1 — initiation (commitment).** The consumer generates a 32-byte request nonce, a fresh X25519 ephemeral key pair, and a 32-byte client secret, all with a cryptographically secure random generator. It computes the commitment `SHA-256("LocalMCPKit pairing commitment v1" || 0x00 || clientSecret)` and sends one `POST /local-mcp/v1/pairing-requests` request:
 
 ```json
 {
@@ -201,36 +214,80 @@ The consumer generates 32 random bytes with a cryptographically secure random ge
     "version": "1.0.0",
     "installationId": "3e260e1c-bb58-4247-9733-47352fbc6c98"
   },
-  "requestNonce": "base64url-encoded-32-random-bytes"
+  "requestNonce": "base64url-encoded-32-random-bytes",
+  "expectedProducerPublicKey": "base64url-encoded-descriptor-channel-binding-key",
+  "expectedInstanceId": "90f3fc7c-b047-4af2-bac1-33b5b0563d16",
+  "expectedEndpoint": "http://127.0.0.1:49152/mcp",
+  "consumerEphemeralPublicKey": "base64url-encoded-32-byte-x25519-public-key",
+  "clientSecretCommitment": "base64url-encoded-32-byte-sha256-commitment"
 }
 ```
 
-`schemaVersion` MUST be the string `1`. Consumer `id`, `name`, and `version` follow the producer descriptor's corresponding validation rules; `installationId` is a canonical lowercase random UUID; and `requestNonce` must decode to exactly 32 bytes. Duplicate object keys are invalid. Readers ignore unknown members but never infer a missing required member from them.
+`schemaVersion` MUST be the string `1`. Consumer `id`, `name`, and `version` follow the producer descriptor's corresponding validation rules; `installationId` is a canonical lowercase random UUID; and `requestNonce` must decode to exactly 32 bytes. The expected fields MUST equal the producer's live descriptor values; a mismatch (for example, a relayed descriptor carrying an attacker's binding) is rejected as a malformed request before any approval prompt. Duplicate object keys are invalid. Readers ignore unknown members but never infer a missing required member from them.
 
-The request uses `Content-Type: application/json`, `Accept: application/json`, no `Origin`, and a maximum body size of 8 KiB. The producer keeps this single HTTP request pending while it asks for approval, for at most 120 seconds. The credential can therefore be returned only as the response to the request that initiated the prompt; V1 has no polling or credential-retrieval endpoint.
+The producer validates the initiation, verifies that the consumer's ephemeral public key produces a non-degenerate X25519 shared secret with its process key, and responds `201 Created`:
 
-Both apps display the same short verification code. It is computed as follows:
+```json
+{
+  "schemaVersion": "1",
+  "pairingId": "base64url-encoded-32-byte-pairing-identifier",
+  "serverNonce": "base64url-encoded-32-random-bytes"
+}
+```
 
-1. Decode the 32 nonce bytes.
-2. Compute SHA-256 over the ASCII bytes `LocalMCPKit pairing v1` followed by one zero byte and the nonce bytes.
-3. Take the first 20 digest bits and encode them as four characters using the Crockford Base32 alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`.
+**Leg 2 — completion (reveal).** The consumer repeats every initiation field byte-for-byte and adds the challenge values and the revealed secret in one `POST /local-mcp/v1/pairing-requests/<pairingId>` request with `Accept: application/vnd.localmcp.secure+json`:
 
-Test vector (the all-zero nonce is for testing only and MUST NOT be generated in production):
+```json
+{
+  "…": "all initiation fields, unchanged",
+  "pairingId": "value from leg 1",
+  "serverNonce": "value from leg 1",
+  "revealedClientSecret": "base64url-encoded-32-byte-committed-secret"
+}
+```
+
+The producer verifies that the completion exactly equals the retained initiation finalized with its own challenge values, that the revealed secret matches the commitment, and that no field — including the consumer ephemeral key — was substituted between legs. Completion is one-shot: the pairing identifier is consumed before approval work begins, and a retry can never mint or retrieve another bearer.
+
+Both requests use `Content-Type: application/json`, no `Origin`, and a maximum body size of 8 KiB. The producer keeps the completion request pending while it asks for approval, for at most 120 seconds from initiation. The credential is returned only as the sealed response to that completion; V1 has no polling or credential-retrieval endpoint.
+
+### Human verification code
+
+Both apps display the same short verification code derived from the finalized pairing transcript:
+
+1. Compute the transcript digest: SHA-256 over the length-prefixed transcript fields labelled `LocalMCPKit pairing transcript v1` (protocol label, suite, schema version, producer ID, instance ID, endpoint, producer public key, consumer identity fields, request nonce, consumer ephemeral public key, commitment, pairing ID, server nonce, revealed secret).
+2. Compute SHA-256 over the ASCII bytes `LocalMCPKit SAS v1` followed by one zero byte and the transcript digest.
+3. Take the first 40 digest bits and encode them as eight characters using the Crockford Base32 alphabet `0123456789ABCDEFGHJKMNPQRSTVWXYZ`.
+
+Transports that cannot channel-bind (the in-process test double) derive the eight-character code from the request nonce alone: SHA-256 over `LocalMCPKit pairing v1`, one zero byte, and the nonce bytes, then the first 40 bits in the same alphabet.
+
+Test vector for the nonce-derived form (the all-zero nonce is for testing only and MUST NOT be generated in production):
 
 ```text
 nonce bytes:       32 bytes of 0x00
 base64url nonce:   AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
 SHA-256 digest:    edcc09810a7f02ef05bed7986d555203443532ddf1ebd7b57e47fe0ef1600cde
-verification code: XQ60
+verification code: XQ60K08A
 ```
+
+The normative transcript, commitment, SAS, KDF, and AAD vectors for the channel-bound form are maintained in the conformance tests.
 
 The code is for human correlation, not authentication, and MUST NOT be persisted or logged. The producer prompt displays the consumer name, stable ID, installation ID (at least a recognizable suffix), and code. Approval is one-shot and tied to the in-memory pending request. Closing/cancelling the request cancels the pending approval.
 
-The producer enforces both a maximum of three concurrent pending requests and a rolling limit of five new requests per minute per producer process. Excess requests receive HTTP 429 and `Retry-After`. Limits are not keyed only by the untrusted claimed consumer ID. A nonce may be used for only one attempt: the producer retains a digest of pending and terminal nonces for at least 10 minutes (or until process exit, if sooner) and rejects a replay. A consumer whose exchange is interrupted starts a new request with a new nonce and requires a new approval.
+The producer enforces both a maximum of three concurrent pending requests and a rolling limit of five new initiations per minute per producer process. Excess requests receive HTTP 429 and `Retry-After`. Limits are not keyed only by the untrusted claimed consumer ID. An initiation may be used for only one attempt: the producer retains a digest of pending and terminal initiations for at least 10 minutes (or until process exit, if sooner) and rejects a replay. A consumer whose exchange is interrupted starts a new initiation with fresh nonce, key, and secret material and requires a new approval.
 
 ### Successful response
 
-Approval atomically creates a unique grant and a 32-byte random bearer credential. The producer returns HTTP 200 with `Cache-Control: no-store`:
+Approval atomically creates a unique grant and a 32-byte random bearer credential, staged producer-side as a pending candidate bound to the running instance and channel binding. The producer returns HTTP 200 with `Cache-Control: no-store` and `Content-Type: application/vnd.localmcp.secure+json`. The body is a sealed envelope:
+
+```json
+{
+  "profile": "localmcp-pairing-response-v1",
+  "transcriptDigest": "base64url-encoded-32-byte-transcript-digest",
+  "sealed": "base64url-encoded-chacha20poly1305-sealed-payload"
+}
+```
+
+The payload key is `HKDF-SHA256(X25519(producerProcessKey, consumerEphemeralKey), salt: transcriptDigest, info: "LocalMCPKit pairing response key v1")`, and the AAD is `"LocalMCPKit pairing response aad v1" || 0x00 || transcriptDigest`. Only the consumer that generated the committed ephemeral key can open it. The decrypted payload is:
 
 ```json
 {
@@ -243,13 +300,20 @@ Approval atomically creates a unique grant and a 32-byte random bearer credentia
     "issuedAt": "2026-07-16T19:00:00Z",
     "expiresAt": null
   },
-  "accessToken": "base64url-encoded-32-random-bytes"
+  "accessToken": "base64url-encoded-32-random-bytes",
+  "endpointBinding": {
+    "instanceId": "90f3fc7c-b047-4af2-bac1-33b5b0563d16",
+    "channelBinding": {
+      "suite": "x25519-hkdf-sha256-chacha20poly1305-v1",
+      "publicKey": "base64url-encoded-producer-process-key"
+    }
+  }
 }
 ```
 
-Timestamps use RFC 3339 UTC form. `expiresAt` is nullable: the V1 default is no automatic grant expiry, while a producer policy MAY issue an expiry. Revocation remains mandatory even for non-expiring grants. The plaintext token is returned once, never retrievable, and is sent on MCP requests as `Authorization: Bearer <accessToken>`.
+Timestamps use RFC 3339 UTC form. `expiresAt` is nullable: the V1 default is no automatic grant expiry, while a producer policy MAY issue an expiry. Revocation remains mandatory even for non-expiring grants. The plaintext token is returned once, never retrievable, and is carried on MCP requests only inside the sealed envelope's logical `authorization` header.
 
-The consumer stores the token and grant metadata in its secure credential store. The producer stores grant metadata and a one-way SHA-256 token digest, not the plaintext token. Token matching is constant-time. Revocation invalidates the grant before the operation reports success.
+The consumer stores the token, grant metadata, and endpoint binding in its secure credential store. The producer stores grant metadata and a one-way SHA-256 token digest, not the plaintext token; the candidate remains pending until its first authenticated request proves that the consumer decrypted the pairing response, which activates it and atomically retires the previous credential for the same identity tuple. A candidate that is never activated — a lost response, a failed consumer store write, or an interrupted rotation — never displaces the previous active grant and is removed rather than tombstoned when rolled back. Token matching is constant-time. Revocation invalidates the grant before the operation reports success.
 
 V1 has no unauthenticated token-retrieval or standalone network rotation route. A consumer rotates by completing a new explicitly approved pairing request for the same identity tuple; successful approval atomically activates the new digest and invalidates the old one. If that exchange fails, the old grant remains valid unless the operator had already revoked it. A producer operator may instead revoke immediately and require a later fresh pairing.
 
@@ -277,6 +341,30 @@ Error bodies have the shape below and MUST NOT echo the nonce, token, authorizat
 }
 ```
 
+## Secure MCP envelope
+
+`localmcp-secure-http` carries every logical MCP request and response inside an authenticated-encryption envelope on `POST /mcp`. The MCP 2025-11-25 lifecycle is unchanged inside the envelope; only its wire carriage differs from generic Streamable HTTP.
+
+The outer request is always `POST /mcp` with `Accept` and `Content-Type` both exactly `application/vnd.localmcp.secure+json`. Outer requests MUST NOT carry `Authorization`, `MCP-Protocol-Version`, or `Mcp-Session-Id` headers; their presence invalidates the envelope. The outer body is:
+
+```json
+{
+  "profile": "localmcp-secure-v1",
+  "suite": "x25519-hkdf-sha256-chacha20poly1305-v1",
+  "requestId": "base64url-encoded-32-random-bytes",
+  "ephemeralPublicKey": "base64url-encoded-32-byte-x25519-public-key",
+  "sealed": "base64url-encoded-chacha20poly1305-sealed-payload"
+}
+```
+
+An unknown or missing `profile` or `suite`, a request identifier that does not decode to exactly 32 bytes, or an ephemeral public key that is malformed, padded, non-canonical, or degenerate (all-zero shared secret) rejects the envelope with an empty HTTP 400 before any credential interpretation.
+
+The request key is derived from `X25519(clientEphemeralKey, producerProcessKey)` with HKDF-SHA256 over a length-prefixed AAD binding the profile, suite, both public keys, the request identifier, the HTTP method, path, authority, and media type. The sealed plaintext is a binary record containing the logical method (`POST` or `DELETE`), an optional monotonic sequence number, the logical headers — `authorization` bearer, `accept`, `content-type`, `mcp-protocol-version`, `mcp-session-id` — and the JSON-RPC body. The decrypted logical body is bounded at 1 MiB independently of the outer envelope bound.
+
+Responses are sealed with a key derived from the same shared secret and a digest of the exact outer request bytes, so a response can only be opened by the requester and only for that one request; swapping responses between requests fails authentication. Plaintext outer statuses (other than transport-level rejections) are never interpreted as authorization results by the client.
+
+Replay is bounded in both directions: an `initialize` (no session) request identifier is one-shot per process, and each session enforces a 64-message anti-replay window over the sealed sequence numbers; a replayed coordinate receives a sealed `secure_replay_rejected` conflict. The producer's X25519 process key is generated per process launch and destroyed on stop, so captured envelopes cannot be decrypted or replayed against a restarted producer, and a listener that takes over a released port cannot open requests sealed to the previous process key.
+
 ## Required conformance tests
 
 The implementation must cover at least:
@@ -284,11 +372,12 @@ The implementation must cover at least:
 - exact TXT encoding and rejection of missing, duplicate, malformed, or oversized fields;
 - ignoring unknown TXT keys and descriptor members;
 - descriptor Codable round trips and forward-compatible fixture decoding;
-- rejection of redirects, non-loopback construction, identity/path/auth mismatches, unsupported schemas, and unsupported MCP versions;
+- rejection of redirects, non-loopback construction, identity/path/auth mismatches, unsupported schemas, unsupported channel-binding suites, malformed binding keys, and unsupported MCP versions;
 - deduplicated added/updated/removed transitions and restart semantics;
 - LocalOnly interface use in registration, browsing, resolution, and callbacks;
-- pairing nonce/code test vectors, nonce replay, expiry, cancellation, denial, rate limits, issuance, rotation, and revocation before Phase 4 ships; and
-- proof that no discovery or descriptor representation contains a secret.
+- the transcript, commitment, SAS, KDF, and AAD vectors, initiation replay, adaptive key substitution across pairing legs, expiry, cancellation, denial, rate limits, issuance, rotation (including lost responses and store failures after candidate issuance), and revocation;
+- secure envelope tamper, replay, response swap, low-order and malformed keys, unknown suites, exact inner and outer payload-size boundaries, and process-key rotation across restarts; and
+- proof that no discovery, descriptor, or outer-wire representation contains a secret.
 
 ## References
 

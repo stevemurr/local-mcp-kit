@@ -5,13 +5,21 @@ import LocalMCPContracts
 @Suite("Producer descriptor")
 struct ProducerDescriptorTests {
     private var descriptor: ProducerDescriptor {
-        ProducerDescriptor(instanceID: validInstanceID, server: validProducerIdentity)
+        ProducerDescriptor(
+            instanceID: validInstanceID,
+            server: validProducerIdentity,
+            channelBinding: ProducerChannelBinding(
+                publicKey: try! ChannelBindingPublicKey(
+                    rawRepresentation: Array(UInt8.min ... UInt8(31))
+                )
+            )
+        )
     }
 
     @Test("Descriptor encoding matches the V1 golden JSON")
     func goldenJSON() throws {
         let expected = """
-        {"capabilities":{"tools":true},"instanceId":"90f3fc7c-b047-4af2-bac1-33b5b0563d16","mcp":{"authentication":"pairing","endpoint":"/mcp","protocolVersions":["2025-11-25"],"transport":"streamable-http"},"schemaVersion":"1","server":{"id":"com.example.notes","name":"Notes","version":"1.0.0"}}
+        {"capabilities":{"tools":true},"channelBinding":{"publicKey":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8","suite":"x25519-hkdf-sha256-chacha20poly1305-v1"},"instanceId":"90f3fc7c-b047-4af2-bac1-33b5b0563d16","mcp":{"authentication":"pairing-channel","endpoint":"/mcp","protocolVersions":["2025-11-25"],"transport":"localmcp-secure-http"},"schemaVersion":"1","server":{"id":"com.example.notes","name":"Notes","version":"1.0.0"}}
         """
 
         #expect(try encodedJSON(descriptor) == expected)
@@ -32,15 +40,20 @@ struct ProducerDescriptorTests {
             "vendor": "Example"
           },
           "mcp": {
-            "transport": "streamable-http",
+            "transport": "localmcp-secure-http",
             "endpoint": "/mcp",
             "protocolVersions": ["2025-11-25"],
-            "authentication": "pairing",
+            "authentication": "pairing-channel",
             "futureTransportOption": 42
           },
           "capabilities": {
             "tools": true,
             "futureCapability": true
+          },
+          "channelBinding": {
+            "suite": "x25519-hkdf-sha256-chacha20poly1305-v1",
+            "publicKey": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+            "futureBindingField": true
           }
         }
         """
@@ -88,7 +101,15 @@ struct ProducerDescriptorTests {
         invalidDescriptors.append(invalid)
 
         invalid = descriptor
+        invalid.mcp.transport = "streamable-http"
+        invalidDescriptors.append(invalid)
+
+        invalid = descriptor
         invalid.mcp.authentication = "none"
+        invalidDescriptors.append(invalid)
+
+        invalid = descriptor
+        invalid.mcp.authentication = "pairing"
         invalidDescriptors.append(invalid)
 
         invalid = descriptor
@@ -252,9 +273,13 @@ struct IdentityAndAdvertisementTests {
         }
         #expect(!LocalMCPValidation.isDisplayName(""))
         #expect(!LocalMCPValidation.isDisplayName("Notes\n"))
+        #expect(!LocalMCPValidation.isDisplayName("Trusted\u{2028}Untrusted"))
+        #expect(!LocalMCPValidation.isDisplayName("Trusted\u{2029}Untrusted"))
         #expect(!LocalMCPValidation.isDisplayName(String(repeating: "a", count: 129)))
         #expect(!LocalMCPValidation.isVersion(""))
         #expect(!LocalMCPValidation.isVersion("1.0.0\n"))
+        #expect(!LocalMCPValidation.isVersion("1.0\u{2028}spoof"))
+        #expect(!LocalMCPValidation.isVersion("1.0\u{2029}spoof"))
         #expect(!LocalMCPValidation.isVersion(String(repeating: "1", count: 65)))
     }
 
@@ -279,7 +304,7 @@ struct IdentityAndAdvertisementTests {
             "id": "com.example.notes",
             "path": "/mcp",
             "desc": "/local-mcp/v1/descriptor.json",
-            "auth": "pair",
+            "auth": "pair-channel",
         ])
     }
 
@@ -293,7 +318,7 @@ struct IdentityAndAdvertisementTests {
         #expect(advertisement.stableProducerID == validProducerIdentity.stableID)
         #expect(advertisement.endpointPath == "/mcp")
         #expect(advertisement.descriptorPath == "/local-mcp/v1/descriptor.json")
-        #expect(advertisement.authentication == "pair")
+        #expect(advertisement.authentication == "pair-channel")
         #expect(advertisement.txtValues["future"] == nil)
     }
 
@@ -317,6 +342,7 @@ struct IdentityAndAdvertisementTests {
             ("desc", "/other.json"),
             ("desc", "/discovery/v1/server.json"),
             ("auth", "none"),
+            ("auth", "pair"),
         ]
         for (key, value) in replacements {
             var altered = valid

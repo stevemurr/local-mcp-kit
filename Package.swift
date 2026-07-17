@@ -43,6 +43,14 @@ let package = Package(
             name: "local-mcp-two-producers-example",
             targets: ["local-mcp-two-producers-example"]
         ),
+        .executable(
+            name: "local-mcp-example-producer",
+            targets: ["local-mcp-example-producer"]
+        ),
+        .executable(
+            name: "local-mcp-example-consumer",
+            targets: ["local-mcp-example-consumer"]
+        ),
     ],
     targets: [
         .target(
@@ -56,7 +64,7 @@ let package = Package(
         ),
         .target(
             name: "LocalMCPDiscoveryBonjour",
-            dependencies: ["LocalMCPDiscovery"],
+            dependencies: ["LocalMCPContracts", "LocalMCPDiscovery"],
             swiftSettings: strictConcurrencySettings
         ),
         .target(
@@ -96,9 +104,31 @@ let package = Package(
         .executableTarget(
             name: "local-mcp",
             dependencies: [
-                "LocalMCPConsumer",
+                "LocalMCPContracts",
+                "LocalMCPDiscovery",
                 "LocalMCPDiscoveryBonjour",
             ],
+            swiftSettings: strictConcurrencySettings
+        ),
+        .executableTarget(
+            name: "local-mcp-example-producer",
+            dependencies: [
+                "LocalMCPContracts",
+                "LocalMCPDiscoveryBonjour",
+                "LocalMCPProducer",
+                "LocalMCPTesting",
+            ],
+            path: "Examples/SeparateProcess/Producer",
+            swiftSettings: strictConcurrencySettings
+        ),
+        .executableTarget(
+            name: "local-mcp-example-consumer",
+            dependencies: [
+                "LocalMCPContracts",
+                "LocalMCPConsumer",
+                "LocalMCPTesting",
+            ],
+            path: "Examples/SeparateProcess/Consumer",
             swiftSettings: strictConcurrencySettings
         ),
         .target(
@@ -130,6 +160,15 @@ let package = Package(
             swiftSettings: strictConcurrencySettings
         ),
         .testTarget(
+            name: "LocalMCPDiscoveryBonjourTests",
+            dependencies: [
+                "LocalMCPContracts",
+                "LocalMCPDiscovery",
+                "LocalMCPDiscoveryBonjour",
+            ],
+            swiftSettings: strictConcurrencySettings
+        ),
+        .testTarget(
             name: "LocalMCPProducerTests",
             dependencies: [
                 "LocalMCPContracts",
@@ -156,6 +195,7 @@ let package = Package(
                 "LocalMCPDiscovery",
                 "LocalMCPProducer",
                 "LocalMCPConsumer",
+                "LocalMCPMCPAdapter",
                 "LocalMCPTesting",
             ],
             swiftSettings: strictConcurrencySettings
@@ -169,6 +209,24 @@ let package = Package(
                 "LocalMCPTesting",
             ],
             path: "Examples/TwoProducers/Tests",
+            swiftSettings: strictConcurrencySettings
+        ),
+        .testTarget(
+            name: "LocalMCPCommandTests",
+            dependencies: [
+                "local-mcp",
+                "LocalMCPContracts",
+                "LocalMCPDiscovery",
+            ],
+            swiftSettings: strictConcurrencySettings
+        ),
+        .testTarget(
+            name: "LocalMCPSeparateProcessTests",
+            dependencies: [
+                "local-mcp",
+                "local-mcp-example-producer",
+                "local-mcp-example-consumer",
+            ],
             swiftSettings: strictConcurrencySettings
         ),
     ],

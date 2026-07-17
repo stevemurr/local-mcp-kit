@@ -68,29 +68,42 @@ private struct StaticConnector: LocalMCPConnecting {
     func connect(to instance: ProducerInstance) async throws -> any LocalMCPService { service }
 }
 
-private actor StubService: LocalMCPService {
+private actor StubService: LocalMCPDisconnectingService {
     var pairingGrant: AuthorizationGrant
     var initialization: LocalMCPInitialization
     var definitions: [CommandDefinition]
     var result: CommandResult
     var authorizationError: LocalMCPError?
+    var initializedError: LocalMCPError?
     let pairingGate: ConsumerTestGate?
     let initializeGate: ConsumerTestGate?
+    let listGate: ConsumerTestGate?
+    let callGate: ConsumerTestGate?
+    let disconnectGate: ConsumerTestGate?
+    private var listLifecycleFailuresRemaining = 0
+    private var callLifecycleFailuresRemaining = 0
     private(set) var pairCalls = 0
     private(set) var initializeCalls = 0
     private(set) var initializedCalls = 0
     private(set) var listCalls = 0
     private(set) var commandCalls = 0
+    private(set) var disconnectCalls = 0
 
     init(
         pairingGrant: AuthorizationGrant,
         result: CommandResult,
         pairingGate: ConsumerTestGate? = nil,
-        initializeGate: ConsumerTestGate? = nil
+        initializeGate: ConsumerTestGate? = nil,
+        listGate: ConsumerTestGate? = nil,
+        callGate: ConsumerTestGate? = nil,
+        disconnectGate: ConsumerTestGate? = nil
     ) {
         self.pairingGrant = pairingGrant
         self.pairingGate = pairingGate
         self.initializeGate = initializeGate
+        self.listGate = listGate
+        self.callGate = callGate
+        self.disconnectGate = disconnectGate
         initialization = LocalMCPInitialization(
             protocolVersion: MCPProtocolVersion.current.rawValue,
             server: producerIdentity,
@@ -124,12 +137,18 @@ private actor StubService: LocalMCPService {
 
     func listCommands(credential: AuthorizationCredential?) async throws -> [CommandDefinition] {
         listCalls += 1
+        await listGate?.arriveAndWait()
+        if listLifecycleFailuresRemaining > 0 {
+            listLifecycleFailuresRemaining -= 1
+            throw LocalMCPError.invalidLifecycleState
+        }
         if let authorizationError { throw authorizationError }
         return definitions
     }
 
     func initialized(credential: AuthorizationCredential?) async throws {
         initializedCalls += 1
+        if let initializedError { throw initializedError }
         if let authorizationError { throw authorizationError }
     }
 
@@ -138,21 +157,43 @@ private actor StubService: LocalMCPService {
         credential: AuthorizationCredential?
     ) async throws -> CommandResult {
         commandCalls += 1
+        await callGate?.arriveAndWait()
+        if callLifecycleFailuresRemaining > 0 {
+            callLifecycleFailuresRemaining -= 1
+            throw LocalMCPError.invalidLifecycleState
+        }
         if let authorizationError { throw authorizationError }
         return result
     }
 
+    func disconnect(credential: AuthorizationCredential?) async {
+        disconnectCalls += 1
+        await disconnectGate?.arriveAndWait()
+    }
+
     func setAuthorizationError(_ error: LocalMCPError?) { authorizationError = error }
+    func setInitializedError(_ error: LocalMCPError?) { initializedError = error }
     func setInitialization(_ value: LocalMCPInitialization) { initialization = value }
-    func counts() -> (pair: Int, initialize: Int, initialized: Int, list: Int, call: Int) {
-        (pairCalls, initializeCalls, initializedCalls, listCalls, commandCalls)
+    func setPairingGrant(_ value: AuthorizationGrant) { pairingGrant = value }
+    func failNextListForMissingSession() { listLifecycleFailuresRemaining += 1 }
+    func failNextCallForMissingSession() { callLifecycleFailuresRemaining += 1 }
+    func counts() -> (
+        pair: Int,
+        initialize: Int,
+        initialized: Int,
+        list: Int,
+        call: Int,
+        disconnect: Int
+    ) {
+        (pairCalls, initializeCalls, initializedCalls, listCalls, commandCalls, disconnectCalls)
     }
 }
 
 private func makeConsumer(
     instance: ProducerInstance,
     service: StubService,
-    store: InMemoryConsumerGrantStore = InMemoryConsumerGrantStore()
+    store: InMemoryConsumerGrantStore = InMemoryConsumerGrantStore(),
+    random: any RandomBytesGenerating = SequenceRandomBytesGenerator()
 ) -> LocalMCPConsumer {
     LocalMCPConsumer(
         instance: instance,
@@ -160,7 +201,7 @@ private func makeConsumer(
         connector: StaticConnector(service: service),
         grantStore: store,
         clock: ManualLocalMCPClock(),
-        random: SequenceRandomBytesGenerator()
+        random: random
     )
 }
 
@@ -294,6 +335,28 @@ struct LocalMCPConsumerTests {
         ) == replacement)
     }
 
+    @Test("A transient producer authorization-store outage preserves the cached grant")
+    func authorizationStoreOutagePreservesGrant() async throws {
+        let expected = try grant(byte: 12)
+        let service = StubService(pairingGrant: expected, result: .text("ok"))
+        let store = InMemoryConsumerGrantStore()
+        let consumer = makeConsumer(instance: try instance(), service: service, store: store)
+        _ = try await consumer.pair()
+        _ = try await consumer.initialize()
+
+        await service.setAuthorizationError(.credentialStoreFailed)
+        await expectLocalError(.credentialStoreFailed) {
+            _ = try await consumer.listTools()
+        }
+        #expect(try await store.grant(
+            producerID: producerIdentity.stableID,
+            consumer: consumerIdentity
+        ) == expected)
+
+        await service.setAuthorizationError(nil)
+        #expect(try await consumer.listTools().map(\.name) == ["echo"])
+    }
+
     @Test("Initialize validates the negotiated protocol and server identity")
     func initializeValidation() async throws {
         let service = StubService(pairingGrant: try grant(), result: .text("ok"))
@@ -312,6 +375,86 @@ struct LocalMCPConsumerTests {
             capabilities: .init()
         ))
         await expectLocalError(.unauthorized) { _ = try await consumer.initialize() }
+    }
+
+    @Test("Initialize rejects malformed peer identity and a missing tools capability")
+    func initializeMetadataValidation() async throws {
+        let malformedService = StubService(pairingGrant: try grant(), result: .text("unused"))
+        let malformedConsumer = makeConsumer(
+            instance: try instance(),
+            service: malformedService
+        )
+        _ = try await malformedConsumer.pair()
+        await malformedService.setInitialization(.init(
+            protocolVersion: MCPProtocolVersion.current.rawValue,
+            server: .init(
+                stableID: producerIdentity.stableID,
+                displayName: "Hostile\u{1B}[31m",
+                version: "1.0.0"
+            ),
+            capabilities: .init()
+        ))
+        await expectLocalError(.unauthorized) {
+            _ = try await malformedConsumer.initialize()
+        }
+        #expect(await malformedService.counts().disconnect == 1)
+
+        let noToolsService = StubService(pairingGrant: try grant(byte: 8), result: .text("unused"))
+        let noToolsConsumer = makeConsumer(instance: try instance(), service: noToolsService)
+        _ = try await noToolsConsumer.pair()
+        await noToolsService.setInitialization(.init(
+            protocolVersion: MCPProtocolVersion.current.rawValue,
+            server: producerIdentity,
+            capabilities: .init(tools: false)
+        ))
+        await expectLocalError(.incompatibleMCPProtocol) {
+            _ = try await noToolsConsumer.initialize()
+        }
+        #expect(await noToolsService.counts().disconnect == 1)
+    }
+
+    @Test("An initialized-notification failure terminates the partial session")
+    func initializedFailureCleanup() async throws {
+        let service = StubService(pairingGrant: try grant(), result: .text("unused"))
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+        await service.setInitializedError(.commandFailed)
+
+        await expectLocalError(.commandFailed) {
+            _ = try await consumer.initialize()
+        }
+        #expect(await service.counts().disconnect == 1)
+    }
+
+    @Test("Peer validation failure has a hard bound even when disconnect ignores cancellation")
+    func boundedValidationFailureCleanup() async throws {
+        let disconnectGate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("unused"),
+            disconnectGate: disconnectGate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+        await service.setInitialization(.init(
+            protocolVersion: MCPProtocolVersion.current.rawValue,
+            server: .init(
+                stableID: producerIdentity.stableID,
+                displayName: "Invalid\u{1B}",
+                version: "1.0.0"
+            ),
+            capabilities: .init()
+        ))
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        let initialization = Task { try await consumer.initialize() }
+        await disconnectGate.waitUntilArrived()
+        await expectLocalError(.unauthorized) {
+            _ = try await initialization.value
+        }
+        #expect(start.duration(to: clock.now) < .seconds(3))
+        await disconnectGate.release()
     }
 
     @Test("Typed calls require structured, decodable, non-error content")
@@ -366,6 +509,227 @@ struct LocalMCPConsumerTests {
         _ = try await first.value
         #expect(await service.counts().pair == 1)
     }
+
+    @Test("Successful re-pair terminates the session authenticated by the rotated grant")
+    func repairingDisconnectsOldSession() async throws {
+        let firstGrant = try grant(byte: 7)
+        let secondGrant = try grant(byte: 8)
+        let service = StubService(pairingGrant: firstGrant, result: .text("ok"))
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+        _ = try await consumer.initialize()
+
+        await service.setPairingGrant(secondGrant)
+        #expect(try await consumer.pair() == secondGrant)
+
+        #expect(await service.counts().disconnect == 1)
+        #expect(try await consumer.listTools().map(\.name) == ["echo"])
+        let counts = await service.counts()
+        #expect(counts.initialize == 2)
+        #expect(counts.initialized == 2)
+    }
+
+    @Test("Caller cancellation during re-pair cleanup cannot return a successful grant")
+    func cancelledRepairCleanup() async throws {
+        let disconnectGate = ConsumerTestGate()
+        let firstGrant = try grant(byte: 7)
+        let secondGrant = try grant(byte: 8)
+        let service = StubService(
+            pairingGrant: firstGrant,
+            result: .text("ok"),
+            disconnectGate: disconnectGate
+        )
+        let store = InMemoryConsumerGrantStore()
+        let consumer = makeConsumer(
+            instance: try instance(),
+            service: service,
+            store: store
+        )
+        _ = try await consumer.pair()
+        _ = try await consumer.initialize()
+        await service.setPairingGrant(secondGrant)
+
+        let repairing = Task { try await consumer.pair() }
+        await disconnectGate.waitUntilArrived()
+        repairing.cancel()
+        await expectLocalError(.cancelled) {
+            _ = try await repairing.value
+        }
+        #expect(try await consumer.storedGrant() == secondGrant)
+        await disconnectGate.release()
+    }
+
+    @Test("A route update cancels a noncooperative list and disconnects its old session")
+    func updateCancelsList() async throws {
+        let gate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("stale"),
+            listGate: gate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+
+        let staleList = Task { try await consumer.listTools() }
+        await gate.waitUntilArrived()
+        try await consumer.update(instance: try instance(
+            id: "20208e3d-f872-46d7-8847-f5a446d12299",
+            port: 42_001
+        ))
+
+        await expectLocalError(.producerUnavailable) {
+            _ = try await staleList.value
+        }
+        #expect(await service.counts().disconnect == 1)
+        await gate.release()
+    }
+
+    @Test("Removal cancels a noncooperative call and discards its late result")
+    func removalCancelsCall() async throws {
+        let gate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("must-not-escape"),
+            callGate: gate
+        )
+        let current = try instance()
+        let consumer = makeConsumer(instance: current, service: service)
+        _ = try await consumer.pair()
+
+        let staleCall = Task {
+            try await consumer.call("echo", arguments: .object([:]))
+        }
+        await gate.waitUntilArrived()
+        await consumer.markRemoved(instanceID: current.instanceID)
+
+        await expectLocalError(.producerUnavailable) {
+            _ = try await staleCall.value
+        }
+        #expect(await service.counts().disconnect == 1)
+        await gate.release()
+        #expect(await consumer.isAvailable == false)
+    }
+
+    @Test("A terminated session retries only safe list and never replays a tool call")
+    func terminatedSessionRecovery() async throws {
+        let service = StubService(pairingGrant: try grant(), result: .text("ok"))
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+
+        await service.failNextListForMissingSession()
+        #expect(try await consumer.listTools().map(\.name) == ["echo"])
+        var counts = await service.counts()
+        #expect(counts.initialize == 2)
+        #expect(counts.initialized == 2)
+        #expect(counts.list == 2)
+
+        await service.failNextCallForMissingSession()
+        await expectLocalError(.invalidLifecycleState) {
+            _ = try await consumer.call("echo", arguments: .object([:]))
+        }
+        counts = await service.counts()
+        #expect(counts.initialize == 3)
+        #expect(counts.initialized == 3)
+        #expect(counts.call == 1)
+
+        #expect(try await consumer.call("echo", arguments: .object([:])) == .text("ok"))
+        counts = await service.counts()
+        #expect(counts.initialize == 3)
+        #expect(counts.call == 2)
+    }
+
+    @Test("Close terminates the cached session and rejects later operations")
+    func close() async throws {
+        let service = StubService(pairingGrant: try grant(), result: .text("ok"))
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+        _ = try await consumer.initialize()
+
+        await consumer.close()
+
+        #expect(await service.counts().disconnect == 1)
+        #expect(await consumer.isAvailable == false)
+        await expectLocalError(.producerUnavailable) {
+            _ = try await consumer.listTools()
+        }
+    }
+
+    @Test("Removal during nonce generation remains producer unavailable")
+    func removalDuringNonceGeneration() async throws {
+        let gate = ConsumerTestGate()
+        let random = GatedRandomBytesGenerator(gate: gate)
+        let service = StubService(pairingGrant: try grant(), result: .text("unused"))
+        let current = try instance()
+        let consumer = makeConsumer(
+            instance: current,
+            service: service,
+            random: random
+        )
+
+        let pairing = Task { try await consumer.pair() }
+        await gate.waitUntilArrived()
+        await consumer.markRemoved(instanceID: current.instanceID)
+
+        await expectLocalError(.producerUnavailable) {
+            _ = try await pairing.value
+        }
+        await gate.release()
+        #expect(await service.counts().pair == 0)
+    }
+
+    @Test("Cancelling the only initialize waiter abandons and disconnects its late session")
+    func cancelledInitializeCleanup() async throws {
+        let gate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("unused"),
+            initializeGate: gate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+
+        let initialization = Task { try await consumer.initialize() }
+        await gate.waitUntilArrived()
+        initialization.cancel()
+        await expectLocalError(.cancelled) {
+            _ = try await initialization.value
+        }
+
+        await gate.release()
+        #expect(await eventuallyConsumerTest {
+            await service.counts().disconnect == 1
+        })
+    }
+
+    @Test("Cancelling one coalesced initialize waiter preserves the other")
+    func oneCancelledInitializeWaiter() async throws {
+        let gate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("unused"),
+            initializeGate: gate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+
+        let first = Task { try await consumer.initialize() }
+        await gate.waitUntilArrived()
+        let second = Task { try await consumer.initialize() }
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        first.cancel()
+        await expectLocalError(.cancelled) {
+            _ = try await first.value
+        }
+        #expect(await service.counts().disconnect == 0)
+
+        await gate.release()
+        #expect(try await second.value.server == producerIdentity)
+        let counts = await service.counts()
+        #expect(counts.initialize == 1)
+        #expect(counts.initialized == 1)
+        #expect(counts.disconnect == 0)
+    }
 }
 
 private final class VerificationDisplayRecorder: @unchecked Sendable {
@@ -405,4 +769,27 @@ private actor ConsumerTestGate {
         releaseWaiters.removeAll()
         waiters.forEach { $0.resume() }
     }
+}
+
+private actor GatedRandomBytesGenerator: RandomBytesGenerating {
+    let gate: ConsumerTestGate
+
+    init(gate: ConsumerTestGate) {
+        self.gate = gate
+    }
+
+    func randomBytes(count: Int) async throws -> [UInt8] {
+        await gate.arriveAndWait()
+        return Array(repeating: 7, count: count)
+    }
+}
+
+private func eventuallyConsumerTest(
+    _ condition: @escaping @Sendable () async -> Bool
+) async -> Bool {
+    for _ in 0 ..< 1_000 {
+        if await condition() { return true }
+        await Task.yield()
+    }
+    return false
 }

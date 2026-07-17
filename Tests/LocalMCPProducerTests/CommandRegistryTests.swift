@@ -154,6 +154,304 @@ struct CommandRegistryTests {
         #expect(await counter.value == 0)
     }
 
+    @Test("JSON Schema object, string, numeric, and array assertions run before handlers")
+    func schemaAssertionsGuardHandlers() async throws {
+        let schema: JSONValue = .object([
+            "type": .string("object"),
+            "required": .array([.string("query"), .string("limit"), .string("scopes")]),
+            "additionalProperties": .bool(false),
+            "properties": .object([
+                "query": .object([
+                    "type": .string("string"),
+                    "minLength": .integer(3),
+                    "maxLength": .integer(12),
+                ]),
+                "limit": .object([
+                    "type": .string("integer"),
+                    "minimum": .integer(1),
+                    "maximum": .integer(100),
+                    "multipleOf": .integer(5),
+                ]),
+                "scopes": .object([
+                    "type": .string("array"),
+                    "minItems": .integer(1),
+                    "maxItems": .integer(2),
+                    "uniqueItems": .bool(true),
+                    "items": .object([
+                        "enum": .array([.string("home"), .string("icloud")]),
+                    ]),
+                ]),
+            ]),
+        ])
+        let registry = CommandRegistry()
+        let counter = InvocationCounter()
+        try await registry.registerDynamic(
+            CommandDefinition(name: "search", description: "Search", inputSchema: schema)
+        ) { _, _ in
+            await counter.increment()
+            return .text("ok")
+        }
+
+        let valid: JSONValue = .object([
+            "query": .string("road map"),
+            "limit": .integer(25),
+            "scopes": .array([.string("home"), .string("icloud")]),
+        ])
+        _ = try await registry.invoke(
+            .init(name: "search", arguments: valid, requestID: "valid"),
+            context: testContext()
+        )
+
+        let invalidValues: [JSONValue] = [
+            .object(["query": .string("ab"), "limit": .integer(25), "scopes": .array([.string("home")])]),
+            .object(["query": .string("a query that is too long"), "limit": .integer(25), "scopes": .array([.string("home")])]),
+            .object(["query": .string("roadmap"), "limit": .integer(24), "scopes": .array([.string("home")])]),
+            .object(["query": .string("roadmap"), "limit": .integer(25), "scopes": .array([.string("home"), .string("home")])]),
+            .object(["query": .string("roadmap"), "limit": .integer(25), "scopes": .array([.string("all")])]),
+            .object(["query": .string("roadmap"), "limit": .integer(25), "scopes": .array([.string("home")]), "extra": .bool(true)]),
+        ]
+        for (index, value) in invalidValues.enumerated() {
+            await expectLocalError(.invalidCommandInput) {
+                _ = try await registry.invoke(
+                    .init(name: "search", arguments: value, requestID: "invalid-\(index)"),
+                    context: testContext()
+                )
+            }
+        }
+        #expect(await counter.value == 1)
+    }
+
+    @Test("JSON Schema combinators, nullable types, const, and tuple prefixes are enforced")
+    func schemaCombinators() async throws {
+        let schema: JSONValue = .object([
+            "type": .string("object"),
+            "required": .array([.string("mode"), .string("value"), .string("tuple")]),
+            "properties": .object([
+                "mode": .object(["const": .string("exact")]),
+                "value": .object([
+                    "anyOf": .array([
+                        .object(["type": .string("null")]),
+                        .object([
+                            "type": .string("string"),
+                            "not": .object(["enum": .array([.string("forbidden")])]),
+                        ]),
+                    ]),
+                ]),
+                "tuple": .object([
+                    "type": .string("array"),
+                    "prefixItems": .array([
+                        .object(["type": .string("string")]),
+                        .object(["type": .string("integer")]),
+                    ]),
+                    "items": .bool(false),
+                ]),
+            ]),
+        ])
+        let registry = CommandRegistry()
+        try await registry.registerDynamic(
+            CommandDefinition(name: "combined", description: "Combined", inputSchema: schema)
+        ) { _, _ in .text("ok") }
+
+        _ = try await registry.invoke(
+            .init(
+                name: "combined",
+                arguments: .object([
+                    "mode": .string("exact"),
+                    "value": .null,
+                    "tuple": .array([.string("item"), .integer(2)]),
+                ]),
+                requestID: "valid"
+            ),
+            context: testContext()
+        )
+        await expectLocalError(.invalidCommandInput) {
+            _ = try await registry.invoke(
+                .init(
+                    name: "combined",
+                    arguments: .object([
+                        "mode": .string("exact"),
+                        "value": .string("forbidden"),
+                        "tuple": .array([.string("item"), .integer(2), .integer(3)]),
+                    ]),
+                    requestID: "invalid"
+                ),
+                context: testContext()
+            )
+        }
+    }
+
+    @Test("Unsupported or malformed assertion schemas fail registration")
+    func malformedSchemasFailRegistration() async {
+        let invalidSchemas: [JSONValue] = [
+            .object(["type": .string("mystery")]),
+            .object(["required": .array([.string("value"), .string("value")])]),
+            .object(["pattern": .string("^[a-z]+$")]),
+            .object(["$dynamicRef": .string("#/$defs/value")]),
+            .object(["minimum": .string("zero")]),
+            .object(["minItems": .integer(2), "maxItems": .integer(1)]),
+            .object(["$ref": .string("#/$defs/value")]),
+        ]
+        for (index, schema) in invalidSchemas.enumerated() {
+            let registry = CommandRegistry()
+            await expectLocalError(.invalidCommandDefinition) {
+                try await registry.registerDynamic(
+                    CommandDefinition(name: "invalid-\(index)", description: "Invalid", inputSchema: schema)
+                ) { _, _ in .text("unreachable") }
+            }
+        }
+    }
+
+    @Test("Schema registration has a total work budget for branching local references")
+    func schemaWorkBudget() async {
+        var definitions: [String: JSONValue] = [
+            "level0": .object(["type": .string("object")]),
+        ]
+        for level in 1 ... 13 {
+            let reference = JSONValue.object([
+                "$ref": .string("#/$defs/level\(level - 1)"),
+            ])
+            definitions["level\(level)"] = .object([
+                "allOf": .array([reference, reference]),
+            ])
+        }
+        let branchingSchema: JSONValue = .object([
+            "$defs": .object(definitions),
+            "$ref": .string("#/$defs/level13"),
+        ])
+        let registry = CommandRegistry()
+
+        await expectLocalError(.invalidCommandDefinition) {
+            try await registry.registerDynamic(
+                CommandDefinition(
+                    name: "budgeted",
+                    description: "Must not expand a schema DAG without a bound.",
+                    inputSchema: branchingSchema
+                )
+            ) { _, _ in .text("unreachable") }
+        }
+    }
+
+    @Test("Local references evaluate sibling assertions and reject malformed pointer escapes")
+    func localReferenceSemantics() async throws {
+        let schema: JSONValue = .object([
+            "type": .string("object"),
+            "$defs": .object([
+                "base": .object([
+                    "type": .string("object"),
+                    "required": .array([.string("value")]),
+                    "properties": .object([
+                        "value": .object(["type": .string("string")]),
+                    ]),
+                ]),
+            ]),
+            "$ref": .string("#/$defs/base"),
+            "maxProperties": .integer(1),
+        ])
+        let registry = CommandRegistry()
+        try await registry.registerDynamic(
+            CommandDefinition(name: "referenced", description: "Referenced", inputSchema: schema)
+        ) { _, _ in .text("ok") }
+
+        _ = try await registry.invoke(
+            .init(
+                name: "referenced",
+                arguments: .object(["value": .string("accepted")]),
+                requestID: "valid-reference"
+            ),
+            context: testContext()
+        )
+        await expectLocalError(.invalidCommandInput) {
+            _ = try await registry.invoke(
+                .init(
+                    name: "referenced",
+                    arguments: .object([
+                        "value": .string("rejected"),
+                        "extra": .bool(true),
+                    ]),
+                    requestID: "sibling-assertion"
+                ),
+                context: testContext()
+            )
+        }
+
+        let malformedPointer: JSONValue = .object([
+            "$defs": .object([
+                "value": .object(["type": .string("string")]),
+            ]),
+            "$ref": .string("#/$defs/~2value"),
+        ])
+        await expectLocalError(.invalidCommandDefinition) {
+            try await CommandRegistry().registerDynamic(
+                CommandDefinition(
+                    name: "malformed-reference",
+                    description: "Malformed reference",
+                    inputSchema: malformedPointer
+                )
+            ) { _, _ in .text("unreachable") }
+        }
+    }
+
+    @Test("Structured results must satisfy their declared output schema")
+    func outputSchemaIsEnforced() async throws {
+        let outputSchema: JSONValue = .object([
+            "type": .string("object"),
+            "required": .array([.string("count")]),
+            "properties": .object([
+                "count": .object(["type": .string("integer"), "minimum": .integer(0)]),
+            ]),
+        ])
+        let registry = CommandRegistry()
+        try await registry.registerDynamic(
+            CommandDefinition(
+                name: "bad-output",
+                description: "Bad output",
+                inputSchema: objectSchema,
+                outputSchema: outputSchema
+            )
+        ) { _, _ in
+            CommandResult(structuredContent: .object(["count": .integer(-1)]))
+        }
+
+        await expectLocalError(.commandFailed) {
+            _ = try await registry.invoke(
+                .init(name: "bad-output", arguments: .object([:]), requestID: "r"),
+                context: testContext()
+            )
+        }
+    }
+
+    @Test("Structured content is always an object, even without an output schema")
+    func structuredContentWireShapeIsEnforced() async throws {
+        let registry = CommandRegistry()
+        try await registry.registerDynamic(
+            CommandDefinition(
+                name: "scalar-success",
+                description: "Invalid scalar result",
+                inputSchema: objectSchema
+            )
+        ) { _, _ in
+            CommandResult(structuredContent: .string("not an object"))
+        }
+        try await registry.registerDynamic(
+            CommandDefinition(
+                name: "scalar-error",
+                description: "Invalid scalar error result",
+                inputSchema: objectSchema
+            )
+        ) { _, _ in
+            CommandResult(structuredContent: .array([]), isError: true)
+        }
+
+        for name in ["scalar-success", "scalar-error"] {
+            await expectLocalError(.commandFailed) {
+                _ = try await registry.invoke(
+                    .init(name: name, arguments: .object([:]), requestID: name),
+                    context: testContext()
+                )
+            }
+        }
+    }
+
     @Test("Handler failures are sanitized and cancellation stays distinct")
     func errorMapping() async throws {
         struct SecretError: Error {}
@@ -223,6 +521,32 @@ struct CommandRegistryTests {
         #expect(await entered.value <= 1)
     }
 
+    @Test("A deadline does not join a handler that ignores cancellation")
+    func nonCooperativeDeadline() async throws {
+        let registry = CommandRegistry()
+        let gate = NonCooperativeCommandGate()
+        try await registry.registerDynamic(definition("noncooperative")) { _, _ in
+            await gate.run()
+        }
+        let call = Task {
+            try await registry.invoke(
+                .init(name: "noncooperative", arguments: .object([:]), requestID: "bounded"),
+                context: testContext(deadline: Date().addingTimeInterval(0.05))
+            )
+        }
+        await gate.waitUntilEntered()
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        await expectLocalError(.requestTimedOut) { _ = try await call.value }
+        #expect(started.duration(to: clock.now) < .seconds(1))
+        #expect(await !gate.didFinish)
+
+        await gate.release()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await gate.didFinish)
+    }
+
     @Test("Sealing freezes mutation without affecting calls")
     func sealing() async throws {
         let registry = CommandRegistry()
@@ -241,4 +565,38 @@ struct CommandRegistryTests {
 private actor InvocationCounter {
     private(set) var value = 0
     func increment() { value += 1 }
+}
+
+private actor NonCooperativeCommandGate {
+    private var entered = false
+    private var finished = false
+    private var released = false
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    var didFinish: Bool { finished }
+
+    func run() async -> CommandResult {
+        entered = true
+        let currentEntryWaiters = entryWaiters
+        entryWaiters.removeAll()
+        for waiter in currentEntryWaiters { waiter.resume() }
+        if !released {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+        finished = true
+        return .text("late success")
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { entryWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let current = releaseWaiters
+        releaseWaiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
 }

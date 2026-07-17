@@ -13,7 +13,7 @@ struct PairingNonceTests {
 
         #expect(try encodedJSON(nonce) == "\"\(zeroNonceEncoding)\"")
         #expect(nonce.withUnsafeBytes { $0 } == Array(repeating: 0, count: 32))
-        #expect(code.withUnsafeDisplayValue { $0 } == "XQ60")
+        #expect(code.withUnsafeDisplayValue { $0 } == "XQ60K08A")
     }
 
     @Test("Pairing nonce Codable representation is one canonical base64url string")
@@ -104,7 +104,7 @@ struct PairingNonceTests {
         #expect(code.debugDescription == "<redacted verification code>")
         #expect(String(describing: code) == "<redacted verification code>")
         #expect(String(reflecting: code) == "<redacted verification code>")
-        #expect(!String(reflecting: code).contains("XQ60"))
+        #expect(!String(reflecting: code).contains("XQ60K08A"))
     }
 
     @Test("Pairing challenge retains only sanitized approval metadata")
@@ -276,18 +276,29 @@ struct CredentialAndGrantTests {
         #expect(digestRepresentations.allSatisfy { $0 == "<redacted credential digest>" })
         #expect(digestRepresentations.allSatisfy { !$0.contains(rawCredential) })
 
-        #expect(grant.description ==
-            "AuthorizationGrant(grantID: grant-123, credential: <redacted>)")
+        #expect(grant.description == "<redacted authorization grant>")
         #expect(grant.debugDescription == grant.description)
         #expect(String(describing: grant) == grant.description)
         #expect(String(reflecting: grant) == grant.description)
         #expect(!grant.description.contains(rawCredential))
 
-        #expect(producerRecord.description ==
-            "ProducerGrantRecord(grantID: grant-123, credentialDigest: <redacted>)")
+        #expect(producerRecord.description == "<redacted producer grant record>")
         #expect(producerRecord.debugDescription == producerRecord.description)
         #expect(String(describing: producerRecord) == producerRecord.description)
         #expect(String(reflecting: producerRecord) == producerRecord.description)
         #expect(!producerRecord.description.contains(rawCredential))
+
+        var hostileMetadata = metadata
+        hostileMetadata.grantID = "\u{001B}[31m forged-log-entry\nnext-line"
+        let hostileGrant = AuthorizationGrant(
+            metadata: hostileMetadata,
+            credential: credential
+        )
+        let hostileRecord = ProducerGrantRecord(
+            metadata: hostileMetadata,
+            credentialDigest: credential.digest
+        )
+        #expect(!hostileGrant.description.contains(hostileMetadata.grantID))
+        #expect(!hostileRecord.description.contains(hostileMetadata.grantID))
     }
 }

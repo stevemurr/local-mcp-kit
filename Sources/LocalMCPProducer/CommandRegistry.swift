@@ -1,5 +1,6 @@
 import Foundation
 import LocalMCPContracts
+import LocalMCPMCPAdapter
 
 /// A concurrency-safe, deterministic registry for typed app-owned commands.
 public actor CommandRegistry {
@@ -43,7 +44,10 @@ public actor CommandRegistry {
         handler: @escaping DynamicHandler
     ) throws {
         guard !sealed else { throw LocalMCPError.invalidLifecycleState }
-        guard definition.isValid else { throw LocalMCPError.invalidCommandDefinition }
+        guard definition.isValid,
+              MCPJSONSchemaValidator.isSupported(schema: definition.inputSchema),
+              definition.outputSchema.map({ MCPJSONSchemaValidator.isSupported(schema: $0) }) ?? true
+        else { throw LocalMCPError.invalidCommandDefinition }
         guard entries[definition.name] == nil else {
             throw LocalMCPError.commandAlreadyRegistered
         }
@@ -70,40 +74,50 @@ public actor CommandRegistry {
             throw LocalMCPError.commandNotFound
         }
 
+        guard MCPJSONSchemaValidator.accepts(
+            request.arguments,
+            schema: entry.definition.inputSchema
+        ) else {
+            throw LocalMCPError.invalidCommandInput
+        }
+
         try await checkCancellationAndDeadline(context.deadline)
 
         do {
             // The sendable closure is copied out of actor state before suspension.
             // Actor reentrancy therefore permits listing and unrelated calls while
             // a host handler is suspended.
-            let result: CommandResult
+            let operation: LocalMCPAsyncOperation<CommandResult>
             if let deadline = context.deadline {
                 let remaining = deadline.timeIntervalSince(await clock.now())
                 guard remaining > 0 else { throw LocalMCPError.requestTimedOut }
-                result = try await withThrowingTaskGroup(of: CommandResult.self) { group in
-                    group.addTask {
-                        try await entry.handler(request.arguments, context)
-                    }
-                    group.addTask { [sleeper] in
+                operation = LocalMCPAsyncOperation(
+                    timeout: { [sleeper] in
                         try await sleeper.sleep(for: remaining)
-                        throw LocalMCPError.requestTimedOut
-                    }
-                    do {
-                        guard let first = try await group.next() else {
-                            group.cancelAll()
-                            throw LocalMCPError.commandFailed
-                        }
-                        group.cancelAll()
-                        return first
-                    } catch {
-                        group.cancelAll()
-                        throw error
-                    }
+                    },
+                    timeoutError: LocalMCPError.requestTimedOut
+                ) {
+                    try await entry.handler(request.arguments, context)
                 }
             } else {
-                result = try await entry.handler(request.arguments, context)
+                operation = LocalMCPAsyncOperation {
+                    try await entry.handler(request.arguments, context)
+                }
             }
+            let result = try await operation.value(cancellationError: LocalMCPError.cancelled)
             try await checkCancellationAndDeadline(context.deadline)
+            if let content = result.structuredContent {
+                // MCP CallToolResult.structuredContent is an object whenever it
+                // is present, for successful and error results alike.
+                guard case .object = content else {
+                    throw LocalMCPError.commandFailed
+                }
+            }
+            if !result.isError, let outputSchema = entry.definition.outputSchema {
+                guard let content = result.structuredContent,
+                      MCPJSONSchemaValidator.accepts(content, schema: outputSchema)
+                else { throw LocalMCPError.commandFailed }
+            }
             return result
         } catch is CancellationError {
             throw LocalMCPError.cancelled

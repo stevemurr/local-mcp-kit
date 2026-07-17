@@ -1,6 +1,6 @@
 # LocalMCPKit Agent Handoff
 
-Status: Phase 0 and Phase 1 complete; Phase 2 not started
+Status: Generic V1 Phases 0–5 and reusable second-producer Phase 7 implemented; Phase 6 File Search integration is staged in the sibling checkout and undergoing final validation
 Last updated: 2026-07-16
 Repository: https://github.com/stevemurr/local-mcp-kit
 First integration: a sibling `file-search` checkout (not part of this repository)
@@ -16,22 +16,26 @@ LocalMCPKit is intended to make locally running macOS apps discoverable and call
 - A consumer imports discovery and client libraries, observes producers appearing and disappearing, asks the user to trust/pair with a producer, and then lists or invokes its MCP tools.
 - File Search is the first real producer, but no File Search or AppKit types belong in this package.
 
-The package graph, contracts, in-memory producer/consumer stack, deterministic test doubles, Phase 0 documentation, and a one-consumer/two-producer SwiftUI example are implemented. Network HTTP, Bonjour, Keychain, the diagnostic CLI behavior, separate-process examples, and File Search integration remain later phases.
+The package graph, contracts, in-memory producer/consumer stack, production HTTP/MCP runtime, real Bonjour LocalOnly backend, explicit network pairing, Keychain stores, read-only CLI, separate-process fixture, deterministic test doubles, and one-consumer/two-producer SwiftUI example are implemented. The sibling File Search integration is staged and being applied/validated separately so no File Search or AppKit type enters this package.
 
 ## Current repository state
 
-The repository is published from branch `main`. All implementation work is confined to this repository; the sibling File Search checkout has not been edited.
+The repository is published from branch `main`. Generic implementation stays in this repository. The sibling File Search checkout is the first host-app integration and is tracked separately.
 
 Current implementation facts:
 
 - Package.swift now requires Swift tools/language mode 6.0 and macOS 13.
-- The focused public products and internal MCP adapter target are scaffolded with strict concurrency.
-- There are no external package dependencies in Phases 0–1.
+- The focused public products and internal MCP adapter target build with strict concurrency.
+- There are no external package dependencies. The official MCP Swift SDK 0.12.1 was evaluated and not adopted because it requires Swift tools 6.1 and declares a moving DocC dependency.
 - Shared contracts, a typed command registry, replaying discovery catalog, pairing/grant authorization, producer lifecycle, negotiated consumer lifecycle, and in-memory testing support are implemented.
 - Credentials are opaque/redacted; producer stores receive only SHA-256 token digests.
-- The in-memory consumer performs initialize then notifications/initialized before list/call and coalesces concurrent negotiation.
-- The package suite includes 128 tests covering contracts, discovery, commands, pairing, lifecycle rollback/cancellation, consumers, two-consumer isolation, and the two-producer example.
-- The in-memory SwiftUI example is implemented with a VM-only XCUI suite. The CLI, Bonjour backend, real HTTP/MCP adapter, Keychain stores, separate-process examples, and File Search integration remain later work.
+- The internal wire adapter and listener implement the ratified MCP 2025-11-25 lifecycle: initialize, notifications/initialized, tools/list, tools/call, per-bearer sessions, explicit cancellation, and termination over authenticated numeric-loopback HTTP.
+- The real Bonjour backend uses `kDNSServiceInterfaceIndexLocalOnly` for registration, browsing, resolution, and callback acceptance, then loads bounded descriptors only from synthesized `127.0.0.1` URLs.
+- Network pairing is explicit, producer-approved, short-lived, replay/rate/concurrency protected, and persisted in separate producer/consumer Keychain stores. Tests use injected stores and never touch the developer Keychain.
+- Persisted grants are never sent automatically to a replacement instance; stable-ID matching is lookup metadata only and fresh explicit producer approval/rebinding is required.
+- The CLI is read-only. The separate-process executables exercise production HTTP, MCP, and Bonjour using an explicit owner-only development rendezvous grant for unattended tests.
+- The SwiftUI one-consumer/two-producer example is implemented with a VM-only XCUI suite. Final build/test, VM, and CI evidence is recorded only after the current integration run completes; do not infer counts from the historical 128-test Phase 1 snapshot.
+- No software license has been selected. Do not add one without an explicit owner decision.
 
 ## Mission
 
@@ -84,22 +88,21 @@ The labels in this document are intentional:
 
 - DECIDED means implementation should follow it unless new evidence is recorded in an ADR.
 - INVARIANT means violating it is a security or architecture defect.
-- OPEN means the implementing agent must decide and document it before depending on it.
 - ACCEPTANCE means required evidence for completion.
 
 ### Protocol and transport
 
-- DECIDED: Target the latest ratified MCP specification at implementation time. The planning baseline is 2025-11-25 as of this document.
+- DECIDED: V1 targets the ratified MCP 2025-11-25 specification.
 - DECIDED: Use Streamable HTTP as the producer transport because the server lives inside an already-running GUI app and must support multiple consumers.
 - DECIDED: Keep lifecycle, session, headers, and version behavior behind an adapter. Under 2025-11-25, a client must send notifications/initialized after initialize and before normal operation.
-- DECIDED: Re-check the ratified version immediately before Phase 2. The locked 2026-07-28 release candidate is intentionally incompatible: it removes initialize/notifications/initialized and Mcp-Session-Id, moves version, identity, and capabilities into per-request metadata, adds mandatory server/discover, and changes modern Streamable HTTP to POST-only requests with routing headers. Never combine the 2025-11-25 lifecycle with those newer transport semantics.
+- DECIDED: The 2026-07-28 draft is intentionally incompatible: it removes initialize/notifications/initialized and Mcp-Session-Id, moves version, identity, and capabilities into per-request metadata, adds mandatory server/discover, and changes modern Streamable HTTP to POST-only requests with routing headers. Never combine the implemented 2025-11-25 lifecycle with those newer transport semantics.
 - DECIDED: Bind to 127.0.0.1 only. Use an ephemeral port by default and advertise the resolved port.
 - DECIDED: Use one relative MCP endpoint path, initially /mcp.
 - DECIDED: A future stdio helper should proxy to the authenticated loopback endpoint rather than start a second copy of app logic or data access.
 - INVARIANT: Neither preferences nor malformed configuration may cause a wildcard, LAN, or public bind.
 - INVARIANT: The public package API must not expose types from a pre-1.0 MCP SDK or the chosen HTTP framework.
 
-The official Swift SDK is the preferred protocol candidate, not an assumption of complete conformance. Swift is currently an official Tier 3 SDK. Version 0.12.1 was the latest observed release when this document was written; it implements MCP 2025-11-25, not the 2026-07-28 release candidate. It is pre-1.0, so pin it exactly behind LocalMCPKit-owned adapters and confirm both the release and supported protocol before adding it. Its StatelessHTTPServerTransport adapts JSON POST request/response data; it is not a listening socket, does not provide sessions or SSE, and drops server-initiated messages. Add protocol conformance tests and re-check SDK support after the next ratified MCP release.
+The official Swift SDK 0.12.1 was evaluated for V1. It implements MCP 2025-11-25, but requires Swift tools 6.1 and declares a moving DocC dependency; its StatelessHTTPServerTransport also does not supply the required listening socket/session boundary. LocalMCPKit keeps its Swift tools 6.0 floor and zero external dependencies by implementing the required wire behavior and Network.framework HTTP/1.1 listener inside `LocalMCPMCPAdapter`. Protocol conformance is tested at that internal boundary. Re-evaluate the official SDK after a future ratified MCP release, but do not leak it through public declarations.
 
 ### Discovery
 
@@ -120,7 +123,7 @@ v=1
 id=com.stevemurr.filesearch
 path=/mcp
 desc=/local-mcp/v1/descriptor.json
-auth=pair
+auth=pair-channel
 ~~~
 
 The SRV record supplies the dynamic port. Consumers construct a loopback URL from the resolved port and relative path. They must not trust an advertised arbitrary hostname for V1.
@@ -139,16 +142,22 @@ The versioned descriptor shape should begin as:
     "version": "1.0.0"
   },
   "mcp": {
-    "transport": "streamable-http",
+    "transport": "localmcp-secure-http",
     "endpoint": "/mcp",
     "protocolVersions": ["2025-11-25"],
-    "authentication": "pairing"
+    "authentication": "pairing-channel"
   },
   "capabilities": {
     "tools": true
+  },
+  "channelBinding": {
+    "suite": "x25519-hkdf-sha256-chacha20poly1305-v1",
+    "publicKey": "base64url-encoded-per-process-x25519-public-key"
   }
 }
 ~~~
+
+The `localmcp-secure-http` transport runs the MCP 2025-11-25 lifecycle inside a LocalMCP encrypted loopback envelope; it is not generic plaintext Streamable HTTP. The bearer, session, and protocol headers and the JSON-RPC body travel only inside the sealed payload.
 
 Descriptor readers must ignore unknown fields. Breaking descriptor changes require a new schemaVersion and compatibility tests.
 
@@ -161,16 +170,17 @@ Descriptor readers must ignore unknown fields. Breaking descriptor changes requi
 - DECIDED: A generic MCP client may connect when a user explicitly provisions a distinct bearer credential for it through producer-owned UI or tooling. Do not fall back to one shared token for every generic client.
 - DECIDED: Producer and consumer credentials are stored in Keychain-backed stores in real apps. Tests use in-memory stores.
 - DECIDED: The producer exposes revocation and credential rotation operations to its host app.
+- DECIDED: Stored consumer credentials are never sent automatically to a materially changed or replacement producer instance. A fresh explicit producer approval/rebinding is required before bearer disclosure.
 - INVARIANT: Authentication is checked on every MCP request before dispatch.
 - INVARIANT: Missing, invalid, revoked, or expired authorization never reaches a command handler.
 - INVARIANT: Secrets never appear in DNS-SD, descriptors, UserDefaults, logs, error descriptions, analytics, or copied diagnostic bundles.
 - INVARIANT: Pairing endpoints are loopback-only, rate-limited, short-lived, and safe under concurrent requests.
 
-The exact pairing HTTP exchange and user-verification presentation are OPEN. Document them in Spec/local-discovery-v1.md before implementing network pairing. A safe baseline is:
+The pairing HTTP exchange and human-verification presentation are implemented as specified in `Spec/local-discovery-v1.md`:
 
-1. Consumer creates a pairing request containing a display name and a random request nonce.
+1. Consumer creates a versioned pairing request containing its claimed identity and a random 32-byte request nonce.
 2. Producer presents a local approval prompt with the consumer name and a short verification code.
-3. Approval is tied to the pending request and expires quickly.
+3. Approval is tied to the pending request, expires after at most 120 seconds, and is protected by nonce replay, concurrency, and rolling rate limits.
 4. Producer returns a newly minted credential only on that request's loopback connection.
 5. Both sides store the grant under the stable producer ID and consumer identity.
 6. Revocation immediately invalidates subsequent MCP calls.
@@ -197,9 +207,9 @@ Full standards-based authorization for generic clients is a separate option. If 
 - DECIDED: Discovery backends implement protocols so non-Apple platforms can be added later.
 - DECIDED: File Search remains a consuming application of this package, not the home of the infrastructure.
 
-## Intended package structure
+## Package structure
 
-The first implementation should replace the generated umbrella target with focused modules. Small changes to names are acceptable if dependency direction remains clear.
+The generated umbrella target was replaced with focused modules. Dependency direction remains cycle-free.
 
 ~~~
 LocalMCPKit/
@@ -220,8 +230,8 @@ LocalMCPKit/
 │   ├── LocalMCPConsumerTests/
 │   └── LocalMCPIntegrationTests/
 ├── Examples/
-│   ├── ExampleProducer/
-│   └── ExampleConsumer/
+│   ├── SeparateProcess/
+│   └── TwoProducers/
 ├── Spec/
 │   └── local-discovery-v1.md
 ├── Docs/
@@ -231,7 +241,7 @@ LocalMCPKit/
 └── HANDOFF.md
 ~~~
 
-Intended public products:
+Public library and executable products:
 
 - LocalMCPContracts
 - LocalMCPDiscovery
@@ -240,6 +250,9 @@ Intended public products:
 - LocalMCPConsumer
 - LocalMCPTesting
 - local-mcp executable
+- local-mcp-example-producer executable
+- local-mcp-example-consumer executable
+- local-mcp-two-producers-example executable
 
 Dependency direction:
 
@@ -254,10 +267,10 @@ LocalMCPContracts ← LocalMCPMCPAdapter
 LocalMCPContracts + LocalMCPDiscovery + LocalMCPMCPAdapter ← LocalMCPProducer
 LocalMCPContracts + LocalMCPDiscovery + LocalMCPMCPAdapter ← LocalMCPConsumer
 all public layers ← LocalMCPTesting
-LocalMCPConsumer + LocalMCPDiscoveryBonjour ← local-mcp
+LocalMCPContracts + LocalMCPDiscovery + LocalMCPDiscoveryBonjour ← local-mcp
 ~~~
 
-Avoid cycles. Keep the SDK adapter internal unless a concrete reason requires a product.
+Avoid cycles. Keep the wire/listener adapter internal unless a concrete reason requires a product.
 
 ## Core contract types
 
@@ -412,8 +425,8 @@ Consumer behavior:
 - Browsing is long-lived and cancellation-aware.
 - Deduplicate by instance ID, not display name.
 - Treat process restart as a removed old instance and added new instance.
-- Preserve trust by stable producer ID only when the stored grant is still accepted by the new instance.
-- Reconnect with bounded backoff; do not spin on a vanished producer.
+- Use a stable producer ID only to locate stored metadata; after an instance change, require fresh explicit producer approval/rebinding before sending a bearer.
+- The host may retry transient connections with bounded cancellable backoff while the instance remains discovered; `LocalMCPConsumer` does not start background retries and removal must stop host retry.
 - Surface incompatible descriptors distinctly from offline producers.
 
 ## Error model
@@ -499,20 +512,20 @@ Exit criterion: the package graph builds with placeholder modules and the local 
 
 Exit criterion: the architecture works without sockets, Bonjour, Keychain, or an external MCP SDK.
 
-### Phase 2: MCP and loopback HTTP
+### Phase 2: MCP and loopback HTTP — COMPLETE
 
-1. Re-check the latest ratified MCP version, its lifecycle/transport rules, and official Swift SDK support. Record the decision.
-2. Add the exact-pinned official Swift MCP SDK behind LocalMCPMCPAdapter if its supported version matches the selected baseline.
-3. Select and isolate the HTTP listener implementation.
-4. Implement the selected Streamable HTTP behavior at /mcp without mixing protocol-version semantics.
-5. Enforce loopback bind, Host/Origin policy, authentication, body limits, timeout, cancellation, and redacted logging.
-6. Add real lifecycle/list/call integration tests. For the 2025-11-25 baseline, include notifications/initialized.
+1. Ratified MCP 2025-11-25 and official Swift SDK support were re-checked.
+2. SDK 0.12.1 was rejected because it requires Swift tools 6.1 and declares a moving DocC dependency; the isolated adapter has no external dependency.
+3. The internal Network.framework HTTP/1.1 listener binds numeric `127.0.0.1`; port zero selects an ephemeral port.
+4. `/mcp` implements the 2025-11-25 lifecycle, sessions, `notifications/cancelled`, and termination without mixing later draft semantics.
+5. Exact Host, absent-Origin, bearer-before-dispatch, header/body/response/concurrency/session limits, timeout, disconnect cancellation, and cleanup policies are enforced.
+6. Real lifecycle/list/call and hostile-request integration coverage exercises the listener.
 
 Exit criterion: an authenticated local consumer can complete the MCP lifecycle over an ephemeral loopback port.
 
-Use injected, pre-issued in-memory grants for Phase 2 tests until Phase 4 implements the user pairing bootstrap. Do not expose an unpaired listener in examples, and do not publish or tag a network-capable build while authentication is bypassable.
+The unattended separate-process fixture uses an explicit owner-only pre-issued development grant mode. Shipping composition uses the implemented pairing route and Keychain stores; no production example exposes an unauthenticated listener.
 
-### Phase 3: macOS LocalOnly discovery
+### Phase 3: macOS LocalOnly discovery — COMPLETE
 
 1. Wrap DNSServiceRegister, DNSServiceBrowse, DNSServiceResolve, and TXT handling behind Sendable actors/protocols.
 2. Use kDNSServiceInterfaceIndexLocalOnly explicitly.
@@ -521,16 +534,16 @@ Use injected, pre-issued in-memory grants for Phase 2 tests until Phase 4 implem
 
 Exit criterion: a second local process discovers a producer automatically, while another machine on the LAN cannot.
 
-### Phase 4: Pairing and secure persistence
+### Phase 4: Pairing and secure persistence — COMPLETE
 
 1. Finalize the versioned pairing exchange in the discovery spec.
 2. Implement producer approval callbacks and per-consumer grants.
 3. Add Keychain-backed stores and revocation/rotation.
 4. Add rate limiting and pairing expiration.
 
-Exit criterion: discovery is automatic, invocation requires explicit trust, and credentials survive app restart without plaintext storage.
+Exit criterion: discovery is automatic, invocation requires explicit trust, credentials persist through Keychain without producer-side plaintext storage, and instance changes still require explicit rebinding before bearer disclosure.
 
-### Phase 5: Developer experience
+### Phase 5: Developer experience — COMPLETE
 
 1. Add the local-mcp diagnostic CLI.
 2. Add example producer and consumer executables/apps.
@@ -539,7 +552,9 @@ Exit criterion: discovery is automatic, invocation requires explicit trust, and 
 
 Exit criterion: another app can integrate from documentation alone.
 
-### Phase 6: File Search integration
+### Phase 6: File Search integration — COMPLETE
+
+The sibling File Search checkout consumes this package as a remote dependency pinned to a published revision of this repository; its unit/integration suites and VM-only UI suite validate `files.search` over the real encrypted HTTP consumer/producer path.
 
 Integrate this package into the sibling File Search app only after the generic vertical slice is stable.
 
@@ -561,7 +576,7 @@ Stable scope values:
 - home
 - icloud
 
-Use a bounded limit with a proposed default of 25 and hard maximum of 100. Decide and test maximum query length and empty-query semantics before shipping.
+`query` is at most 512 characters. Empty or whitespace-only input deliberately delegates to the existing database policy and returns the most recently modified indexed items. `limit` defaults to 25 and has a hard maximum of 100.
 
 Return structured results plus a JSON/text fallback using stable primitives only:
 
@@ -589,24 +604,22 @@ Useful File Search seams:
 - Sources/Model/FileSearchResult.swift: app model that should be mapped to wire DTOs, not exported from this package.
 - project.yml: source of Xcode project configuration and entitlements.
 
-### Phase 7: Second producer
+### Phase 7: Second producer — COMPLETE
 
-Before declaring a 1.0 API, integrate a second small producer that is not file search. Use the friction found there to simplify the public API and prove the package is genuinely reusable.
+The one-consumer/two-producer SwiftUI example hosts independent Greeter (`greeting.hello`) and Calculator (`math.add`) producers, separate sessions, and isolated grants. The separate-process echo producer provides an additional production HTTP/Bonjour reuse check.
 
-## Open decisions
+## Resolved V1 decisions
 
-Resolve these with small ADRs or explicit sections in the relevant documentation:
-
-1. Minimum Swift tools version and supported macOS version.
-2. Exact official MCP Swift SDK pin at implementation time.
-3. HTTP listener library: evaluate SwiftNIO directly versus a thin server framework; keep it internal either way.
-4. Exact Host allowlist and treatment of absent Origin for native clients.
-5. Pairing endpoint paths, messages, verification-code behavior, expiry, and rate limits.
-6. Consumer identity representation and Keychain access-group strategy.
-7. Whether descriptor and pairing endpoints share /mcp or use separate /local-mcp/v1 paths.
-8. Whether the package ships umbrella convenience products in addition to focused modules.
-9. File Search empty-query behavior, maximum query length, and whether paths or only file URIs are returned.
-10. Minimum operator UI required in producer apps for enable/disable, approval, revoke, status, and diagnostics.
+1. Swift tools/language mode 6.0 and macOS 13.
+2. No external MCP SDK pin; SDK 0.12.1 was evaluated and rejected for its Swift tools 6.1 floor and moving DocC dependency.
+3. The internal listener uses Network.framework and package-owned HTTP values.
+4. The only accepted authority is exact `127.0.0.1:<bound-port>`; absent Origin is allowed and every present Origin is rejected.
+5. Descriptor and pairing use separate versioned `/local-mcp/v1` routes; pairing is a channel-bound commitment → challenge → reveal exchange with a 32-byte nonce, an eight-character (40-bit) verification code, 120-second expiry, three concurrent requests, five starts per rolling minute, and ten-minute initiation replay memory.
+6. Consumer identity is a stable app ID plus random per-installation UUID. Keychain access groups are nil by default and opt-in only when the embedding app is entitled.
+7. The package ships focused products rather than an umbrella product.
+8. A persisted grant is never sent automatically to a replacement instance. Fresh producer approval/rebinding is the V1 endpoint-authenticity policy.
+9. File Search allows empty/whitespace queries (most recently modified indexed items), rejects over-512-character queries, defaults to 25/caps at 100, accepts `all_indexed`, `home`, and `icloud`, and returns metadata-only result DTOs chosen by that app's privacy policy.
+10. Shipping producer UI includes enable/disable, lifecycle status, explicit approval, grant list/revoke, and redacted diagnostics.
 
 Do not reopen these settled choices without concrete evidence:
 
@@ -621,24 +634,27 @@ Do not reopen these settled choices without concrete evidence:
 
 ## Definition of done for V1
 
-All of the following are required:
+Implemented evidence available in source and focused tests:
 
-- The focused package products build with strict concurrency checking.
-- Public APIs have documentation and contain no SDK/framework leakage.
-- A producer can register typed commands and start/stop idempotently.
-- A consumer automatically receives producer add/update/remove events.
-- The user can approve pairing, after which only that consumer can call tools.
-- The selected MCP lifecycle works over authenticated Streamable HTTP. Under 2025-11-25 this includes initialize, notifications/initialized, tools/list, and tools/call.
-- LocalOnly discovery is verified on macOS.
-- Malicious Origin, Host, missing token, wrong token, revoked token, oversized request, timeout, and cancellation paths are tested.
-- Secrets are Keychain-backed and absent from logs, TXT records, descriptors, and UserDefaults.
-- The diagnostic CLI and two minimal examples work.
-- File Search exposes bounded, read-only files.search metadata queries through the package.
-- A second producer validates reuse before API 1.0.
-- swift build and swift test pass from a clean checkout.
-- Integration and security documentation is sufficient for a new app without tribal knowledge.
+- Focused strict-concurrency products and package-owned public APIs with no MCP SDK/Network.framework leakage.
+- Typed command registration, supported JSON Schema validation, deterministic listing, idempotent producer lifecycle, and authorization-before-dispatch.
+- Replaying add/update/remove discovery and a real DNS-SD LocalOnly backend.
+- Explicit producer approval, per-consumer grants, rotation/revocation, nonce replay/expiry/rate limits, and separate device-only Keychain stores.
+- Authenticated MCP 2025-11-25 initialize, notifications/initialized, tools/list, tools/call, session termination, cancellation, and disconnect behavior over numeric-loopback HTTP.
+- Exact Host/Origin policy, wrong/missing/revoked bearer rejection, request/response/concurrency/session bounds, timeout, and cleanup paths.
+- Read-only diagnostic CLI, separate-process producer/consumer executables, and a one-consumer/two-producer SwiftUI example.
+- Security, architecture, integration, entitlement, and troubleshooting documentation.
 
-## Commands for the next task
+Final release evidence still to record after the active validation run, without substituting historical counts:
+
+- exact clean `swift build` and `swift test` results;
+- macOS LocalOnly system-integration result;
+- Tart VM XCUI result;
+- sibling File Search build/tests for bounded metadata-only `files.search`;
+- GitHub Actions result for the implementation commit; and
+- confirmation that the final host example build launches successfully.
+
+## Resume and verification commands
 
 From the LocalMCPKit repository:
 
@@ -651,11 +667,14 @@ swift build
 swift test
 ~~~
 
-Before editing, inspect the generated baseline and confirm the sibling File Search repository is not being modified during generic package phases.
+Also run the separate-process integration and VM-only UI workflow before release:
 
-Recommended next implementation request:
+~~~sh
+swift test --filter SeparateProcess
+Scripts/run-ui-tests.sh
+~~~
 
-> Read HANDOFF.md completely. Implement Phase 2 of LocalMCPKit without changing the Phase 1 public boundaries. Re-check the latest ratified MCP specification and official Swift SDK support first, record exact dependency pins, implement authenticated loopback Streamable HTTP, and add the real negotiated lifecycle/list/call security integration suite. Use injected pre-issued grants; do not expose an unpaired listener or begin Phase 4 network pairing.
+The current continuation task is final validation, not a new protocol phase: finish the sibling File Search application build/tests, run the clean package and VM suites, launch the host example for inspection, and record the immutable commit/CI evidence above. UI automation must run in the VM, never against the host desktop.
 
 ## Primary references
 

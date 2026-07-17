@@ -2,7 +2,7 @@
 
 ## Document status
 
-This is the V1 host-app integration contract. During Phases 0 and 1, the examples describe the API direction being implemented; they are not a claim that network, Bonjour, Keychain, or MCP SDK targets already exist. Keep examples synchronized with public declarations as the package is built.
+This is the V1 host-app integration contract for the implemented package. It covers both deterministic in-memory composition and the production numeric-loopback HTTP, LocalOnly Bonjour, explicit pairing, and Keychain backends.
 
 LocalMCPKit supports macOS 13 or later and Swift language mode 6. It ships focused library products, not an umbrella product.
 
@@ -13,12 +13,12 @@ LocalMCPKit supports macOS 13 or later and Swift language mode 6. It ships focus
 | Shared DTO/schema library | `LocalMCPContracts` |
 | Platform-neutral discovery consumer | `LocalMCPContracts`, `LocalMCPDiscovery`, `LocalMCPConsumer` |
 | macOS automatic discovery consumer | Above plus `LocalMCPDiscoveryBonjour` |
-| In-process producer | `LocalMCPContracts`, `LocalMCPProducer` |
+| Production in-process producer | `LocalMCPContracts`, `LocalMCPDiscoveryBonjour`, `LocalMCPProducer` |
 | Tests and previews | Relevant products plus `LocalMCPTesting` |
 
-`LocalMCPMCPAdapter` is internal and cannot be imported. Host code never needs the underlying MCP SDK or HTTP framework.
+`LocalMCPMCPAdapter` is internal and cannot be imported. Host code never needs an MCP wire or HTTP framework type.
 
-Phases 0 and 1 have no external package dependencies. The MCP SDK and listener dependencies will be exact-pinned behind internal adapters in Phase 2; consumers of LocalMCPKit should not add those packages independently unless they have unrelated uses.
+V1 has no external package dependencies. The official MCP Swift SDK 0.12.1 was evaluated but not adopted because it requires Swift tools 6.1 and declares a moving DocC dependency. LocalMCPKit's isolated internal adapter implements the ratified MCP 2025-11-25 behavior while preserving the package's Swift tools 6.0/macOS 13 floor.
 
 ## Producer integration
 
@@ -69,7 +69,7 @@ struct SearchNotesOutput: Codable, Sendable {
 }
 ```
 
-Provide explicit JSON input and output schemas. Phase 1 validates that schema documents are finite JSON objects and typed dispatch validates Codable structure. It does not yet implement general JSON Schema constraint evaluation. Until the Phase 2 adapter adds validation before dispatch, host handlers must enforce nonempty strings, lengths, enum values, numeric bounds, additional-property policy, and app authorization themselves. Swift decoding alone is not a schema or an input-policy boundary.
+Provide explicit JSON input and output schemas whose roots declare `"type": "object"`, as required by MCP tools. Registration rejects malformed or unsupported assertion schemas, and dispatch validates supported type, object, array, bounded string, numeric, combinator, constant, enum, and nullable assertions before the typed handler runs. Schema traversal has both depth and total-work budgets, including through local references. V1 deliberately rejects regular-expression `pattern`, `$dynamicRef`, and `$recursiveRef` assertions because they cannot meet the same bounded evaluation model; enforce lexical rules with bounded app code in the handler. Structured content must be an object even when no output schema is declared; a non-error structured result is also validated against the output schema when present. Host handlers must still enforce app-specific semantic rules and authorization; schema validation is not a data-policy boundary.
 
 Use a stable, namespaced command name such as `notes.search`. Once released, changing a name or changing the meaning/type of a field is breaking. Add optional fields with defaults or introduce a new command/version for breaking behavior.
 
@@ -93,21 +93,24 @@ let definition = CommandDefinition(
 
 Annotations are hints, not permissions. LocalMCPKit still authenticates every call and the handler still enforces host-app data policy.
 
+When annotations are omitted, MCP's conservative defaults apply: a tool is
+treated as potentially destructive and open-world, while read-only and
+idempotent default to false. Set every hint explicitly when the host can make a
+stronger claim; never rely on an omitted field to make a tool appear safer.
+
 ### 3. Register handlers
 
 The intended producer usage is concurrency-native:
 
 ```swift
+let discovery = BonjourLocalMCPDiscovery()
 let producer = LocalMCPProducer(
     identity: identity,
     configuration: .localOnly(),
-    transport: producerTransport,
-    advertiser: localOnlyAdvertiser,
-    grantStore: producerGrantStore,
+    transport: LocalMCPHTTPProducerTransport(),
+    advertiser: discovery,
+    grantStore: try KeychainProducerGrantStore(),
     approval: approvalController,
-    clock: clock,
-    sleeper: sleeper,
-    random: secureRandom
 )
 
 try await producer.register(definition) {
@@ -139,9 +142,9 @@ Provide an approval controller that can present one request and return Allow or 
 - the short verification code also shown in the consumer; and
 - explicit Allow and Deny actions.
 
-There is no default allow, background auto-approval, or “trust every local app” mode. Expired/cancelled requests dismiss their prompt and cannot later be approved. The network exchange is defined for Phase 4 in [the local discovery profile](../Spec/local-discovery-v1.md#pairing-exchange-phase-4-wire-baseline).
+There is no default allow, background auto-approval, or “trust every local app” mode. Expired/cancelled requests dismiss their prompt and cannot later be approved. The implemented network exchange is defined in [the local discovery profile](../Spec/local-discovery-v1.md#pairing-exchange). It is a LocalMCPKit bootstrap extension, not MCP OAuth.
 
-Phase 1 tests inject an in-memory approval controller, so tests can pause, inspect, approve, deny, expire, or cancel a pending request without UI.
+Tests inject an in-memory approval controller, so they can pause, inspect, approve, deny, expire, replay, rate-limit, or cancel a pending request without UI or a real Keychain.
 
 ### 5. Compose lifecycle
 
@@ -216,8 +219,8 @@ When the user selects Pair, create a consumer for the selected compatible instan
 let client = LocalMCPConsumer(
     instance: selectedInstance,
     identity: consumerIdentity,
-    connector: connector,
-    grantStore: consumerGrantStore
+    connector: LocalMCPHTTPConnector(),
+    grantStore: try KeychainConsumerGrantStore()
 )
 
 let grant = try await client.pair { verificationCode in
@@ -244,17 +247,27 @@ let result: SearchNotesOutput = try await client.call(
 
 The consumer must initialize MCP before normal operations, negotiate an exact protocol version intersection, send `notifications/initialized` under the 2025-11-25 baseline, and send the grant on each request. The package wrapper owns those transport details and coalesces concurrent negotiation on one cached connection.
 
+If a cached MCP session has expired, `listTools` may perform one fresh negotiation and retry the read-only listing. `call` never replays a command automatically: it re-establishes the session for a later explicit call but returns the original lifecycle error to the current caller. This matters even when a tool advertises idempotence, because annotations are hints and a response may have been lost after the producer performed work.
+
+Close a producer-bound consumer when its feature, account, or app-owned dependency container is torn down:
+
+```swift
+await client.close()
+```
+
+Closing cancels outstanding work, best-effort terminates the cached MCP session within a fixed bound, and makes later operations fail as cancelled. Updating or removing the selected producer instance invalidates the old route and session automatically. A successful re-pair also terminates the old session before the new grant becomes active.
+
 Tool discovery does not mean every tool should be given to an LLM. The consumer app owns allowlists, user confirmation, model/tool exposure, command annotation interpretation, and any policy narrower than the producer grant.
 
-On a producer process restart, a consumer may locate stored grant metadata by stable producer ID, but it must not treat the new advertisement as authenticated. The Phase 4 security decision must define how the endpoint is authenticated before a bearer is sent; until then, require a fresh producer-side approval for a changed instance. Reconnect uses bounded backoff and stops when discovery reports removal.
+On a producer process restart, a consumer may locate stored grant metadata by stable producer ID, but it must not treat the new advertisement as authenticated. LocalMCPKit deliberately never sends that bearer automatically after the instance changes. Require fresh explicit producer-side approval/rebinding, then use the newly returned grant. The host may retry transient connection failures with bounded cancellable backoff only while discovery still reports the instance; `LocalMCPConsumer` does not start background retries.
 
 ## Keychain and entitlements
 
-Real integrations use the provided Keychain-backed credential stores once Phase 4 is implemented. By default, each app stores its side in its own Keychain access group. Producer and consumer do not share Keychain items.
+Real integrations use `KeychainProducerGrantStore` and `KeychainConsumerGrantStore`. By default, each app stores its side in its own Keychain namespace with no explicit access group. Producer and consumer do not share Keychain items. Producer records contain credential digests rather than plaintext bearers; the consumer record contains only that consumer's own bearer and grant metadata.
 
 If an app suite intentionally shares grants between its own signed components, pass an explicit access group that the host already entitles. LocalMCPKit does not infer or create one. Items are non-synchronizing and device-only; account migration or iCloud Keychain must not silently copy bearer grants to another Mac.
 
-For sandboxed network phases:
+For sandboxed production networking:
 
 - a producer app needs the macOS App Sandbox network-server entitlement;
 - a consumer app needs the network-client entitlement; and
@@ -298,7 +311,7 @@ start → discover → pairing required → approve → initialize → initializ
 
 Add a second flow with two consumer installations and prove revoking one does not affect the other. Use invocation counters to prove rejected calls did not dispatch. Use an injected clock/random source to test expiry and rotation deterministically; do not sleep or assert on real random values.
 
-When the package network phases are available, add integration coverage for the embedding app's entitlements and lifecycle in addition to package tests. A clean test run must leave no listener, discovery registration, task, prompt, or Keychain test item behind.
+Add integration coverage for the embedding app's signed entitlements and lifecycle in addition to package tests. Exercise the real HTTP/Bonjour path in a separate-process test, while keeping Keychain unit tests on injected access doubles so a test never touches a developer's Keychain. A clean test run must leave no listener, discovery registration, task, prompt, rendezvous secret, or Keychain test item behind.
 
 ## Errors and user messaging
 
@@ -359,16 +372,22 @@ It may be revoked, rotated, expired by host policy, lost from Keychain, or names
 
 Verify the host handler is not forced through UI state, observes `CommandContext` cancellation/deadline, and does not hold an actor while waiting on unrelated work. Preserve the trace ID and sanitized category for correlation.
 
-## Phase-aware adoption
+## Adoption order
 
-- **Phase 1:** Integrate/test contracts and the in-memory vertical slice only.
-- **Phase 2:** Re-check the latest ratified MCP version, then add authenticated Streamable HTTP and real lifecycle/list/call tests. Under the 2025-11-25 baseline the lifecycle includes initialize and notifications/initialized.
-- **Phase 3:** Turn on LocalOnly Bonjour discovery and signed-app discovery tests.
-- **Phase 4:** Add producer approval UI and Keychain persistence using the versioned pairing exchange.
-- **Phase 5:** Use the diagnostic CLI and example apps as external integration checks.
-- **Phase 6+:** Add app-specific commands only after the generic slice is stable.
+1. Prove command schemas, handlers, authorization, and lifecycle using `LocalMCPTesting`.
+2. Compose `LocalMCPHTTPProducerTransport`, `BonjourLocalMCPDiscovery`, an explicit `PairingApproving` implementation, and `KeychainProducerGrantStore` in one app-owned dependency container.
+3. Add enable/status, approval, grant list/revoke, and redacted diagnostics UI.
+4. Apply the host target's sandbox entitlements and test the signed product, not only SwiftPM.
+5. Add a separate-process negotiated lifecycle test and run UI tests in an isolated VM.
 
-File Search-specific empty-query, maximum-query, and path/URI choices are deliberately not set by this generic guide; they belong to the File Search integration phase and its privacy policy.
+The sibling File Search integration is the first real app integration and is staged alongside V1 validation. Its `files.search` command is read-only and metadata-only. It queries `FileIndexDatabase` through a small `Sendable` boundary rather than the UI's `MainActor` service. Policy is fixed as follows:
+
+- `query` may be empty or whitespace-only, in which case the existing database policy returns the most recently modified indexed items; nonempty queries are capped at 512 characters;
+- `limit` defaults to 25 and has a hard maximum of 100;
+- `scope` is one of `all_indexed`, `home`, or `icloud`; and
+- results expose metadata only—no contents, open/reveal, mutation, rebuild, or arbitrary-path operation.
+
+The generic package contains no File Search types. The app integration owns its privacy-preserving result DTO, approval/operator UI, network-server entitlement, and lifecycle ordering: start after index access is ready and stop MCP before releasing security-scoped folder access.
 
 ## Related documents
 

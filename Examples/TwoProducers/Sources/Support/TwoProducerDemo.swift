@@ -91,8 +91,8 @@ public struct TwoProducerDemoSnapshot: Sendable, Equatable {
 
 /// A complete in-process demonstration of one consumer identity talking to two
 /// independent producers. The transport, stores, and discovery backend are the
-/// Phase 1 in-memory implementations; swapping those boundaries for HTTP,
-/// Keychain, and Bonjour does not change the orchestration shown here.
+/// Deterministic in-memory implementations; swapping those boundaries for the
+/// production HTTP, Keychain, and Bonjour backends does not change this flow.
 public actor TwoProducerDemo {
     private struct MutableProducerState: Sendable {
         var instance: ProducerInstance?
@@ -205,9 +205,9 @@ public actor TwoProducerDemo {
 
     @discardableResult
     public func start() async throws -> TwoProducerDemoSnapshot {
-        await acquireOperation()
-        defer { releaseOperation() }
-        return try await startSerialized()
+        try await withOperation {
+            try await startSerialized()
+        }
     }
 
     private func startSerialized() async throws -> TwoProducerDemoSnapshot {
@@ -258,94 +258,99 @@ public actor TwoProducerDemo {
         }
     }
 
+    /// Schedules another one-shot finalization failure for the next pairing.
+    /// Used only by the example's deterministic rollback tests.
+    public func schedulePairingFinalizationFailure(
+        _ failure: DemoPairingFinalizationFailure
+    ) {
+        pendingPairingFinalizationFailure = failure
+    }
+
     @discardableResult
     public func pair(
         with kind: DemoProducerKind,
         displayVerificationCode: (@Sendable (PairingVerificationCode) -> Void)? = nil
     ) async throws -> TwoProducerDemoSnapshot {
-        await acquireOperation()
-        defer { releaseOperation() }
-
-        guard running, let consumer = consumers[kind] else {
-            throw LocalMCPError.producerUnavailable
-        }
-
-        let grant = try await consumer.pair(displayVerificationCode: displayVerificationCode)
-        do {
-            if pendingPairingFinalizationFailure == .initialization(kind) {
-                pendingPairingFinalizationFailure = .none
-                throw LocalMCPError.commandFailed
-            }
-            _ = try await consumer.initialize(grant: grant)
-            if pendingPairingFinalizationFailure == .toolListing(kind) {
-                pendingPairingFinalizationFailure = .none
-                throw LocalMCPError.commandFailed
-            }
-            let tools = try await consumer.listTools(grant: grant)
-            guard tools.map(\.name) == [kind.commandName] else {
-                throw LocalMCPError.commandFailed
+        try await withOperation {
+            guard running, let consumer = consumers[kind] else {
+                throw LocalMCPError.producerUnavailable
             }
 
-            grants[kind] = grant
-            states[kind]?.status = .paired
-            states[kind]?.tools = tools.map(\.name)
-            appendEvent("Paired with \(kind.displayName); the demo auto-approved the producer prompt.")
-            return makeSnapshot()
-        } catch {
-            try? await producer(kind).revokeGrant(grant.metadata.grantID)
-            try? await consumerStore.remove(
-                producerID: kind.stableID,
-                consumer: consumerIdentity,
-                ifCredentialMatches: grant.credential
-            )
-            grants.removeValue(forKey: kind)
-            states[kind]?.status = .discovered
-            states[kind]?.tools = []
-            throw error
+            let grant = try await consumer.pair(displayVerificationCode: displayVerificationCode)
+            do {
+                if pendingPairingFinalizationFailure == .initialization(kind) {
+                    pendingPairingFinalizationFailure = .none
+                    throw LocalMCPError.commandFailed
+                }
+                _ = try await consumer.initialize(grant: grant)
+                if pendingPairingFinalizationFailure == .toolListing(kind) {
+                    pendingPairingFinalizationFailure = .none
+                    throw LocalMCPError.commandFailed
+                }
+                let tools = try await consumer.listTools(grant: grant)
+                guard tools.map(\.name) == [kind.commandName] else {
+                    throw LocalMCPError.commandFailed
+                }
+
+                grants[kind] = grant
+                states[kind]?.status = .paired
+                states[kind]?.tools = tools.map(\.name)
+                appendEvent("Paired with \(kind.displayName); the demo auto-approved the producer prompt.")
+                return makeSnapshot()
+            } catch {
+                try? await producer(kind).revokeGrant(grant.metadata.grantID)
+                try? await consumerStore.remove(
+                    producerID: kind.stableID,
+                    consumer: consumerIdentity,
+                    ifCredentialMatches: grant.credential
+                )
+                grants.removeValue(forKey: kind)
+                states[kind]?.status = .discovered
+                states[kind]?.tools = []
+                throw error
+            }
         }
     }
 
     @discardableResult
     public func sendGreeting(to name: String) async throws -> TwoProducerDemoSnapshot {
-        await acquireOperation()
-        defer { releaseOperation() }
-
-        let consumer = try pairedConsumer(for: .greeter)
-        do {
-            let output: GreetingOutput = try await consumer.call(
-                DemoProducerKind.greeter.commandName,
-                input: GreetingInput(name: name),
-                as: GreetingOutput.self
-            )
-            states[.greeter]?.lastResult = output.message
-            states[.greeter]?.invocationCount += 1
-            appendEvent("Called greeting.hello.")
-            return makeSnapshot()
-        } catch {
-            handleCallFailure(error, kind: .greeter)
-            throw error
+        try await withOperation {
+            let consumer = try pairedConsumer(for: .greeter)
+            do {
+                let output: GreetingOutput = try await consumer.call(
+                    DemoProducerKind.greeter.commandName,
+                    input: GreetingInput(name: name),
+                    as: GreetingOutput.self
+                )
+                states[.greeter]?.lastResult = output.message
+                states[.greeter]?.invocationCount += 1
+                appendEvent("Called greeting.hello.")
+                return makeSnapshot()
+            } catch {
+                handleCallFailure(error, kind: .greeter)
+                throw error
+            }
         }
     }
 
     @discardableResult
     public func add(_ left: Int, _ right: Int) async throws -> TwoProducerDemoSnapshot {
-        await acquireOperation()
-        defer { releaseOperation() }
-
-        let consumer = try pairedConsumer(for: .calculator)
-        do {
-            let output: AddOutput = try await consumer.call(
-                DemoProducerKind.calculator.commandName,
-                input: AddInput(left: left, right: right),
-                as: AddOutput.self
-            )
-            states[.calculator]?.lastResult = "\(left) + \(right) = \(output.sum)"
-            states[.calculator]?.invocationCount += 1
-            appendEvent("Called math.add.")
-            return makeSnapshot()
-        } catch {
-            handleCallFailure(error, kind: .calculator)
-            throw error
+        try await withOperation {
+            let consumer = try pairedConsumer(for: .calculator)
+            do {
+                let output: AddOutput = try await consumer.call(
+                    DemoProducerKind.calculator.commandName,
+                    input: AddInput(left: left, right: right),
+                    as: AddOutput.self
+                )
+                states[.calculator]?.lastResult = "\(left) + \(right) = \(output.sum)"
+                states[.calculator]?.invocationCount += 1
+                appendEvent("Called math.add.")
+                return makeSnapshot()
+            } catch {
+                handleCallFailure(error, kind: .calculator)
+                throw error
+            }
         }
     }
 
@@ -353,31 +358,30 @@ public actor TwoProducerDemo {
     /// the example proves that the consumer observes and purges the rejected grant.
     @discardableResult
     public func revoke(_ kind: DemoProducerKind) async throws -> TwoProducerDemoSnapshot {
-        await acquireOperation()
-        defer { releaseOperation() }
+        try await withOperation {
+            guard running,
+                  let grant = grants[kind],
+                  let consumer = consumers[kind]
+            else { throw LocalMCPError.pairingRequired }
 
-        guard running,
-              let grant = grants[kind],
-              let consumer = consumers[kind]
-        else { throw LocalMCPError.pairingRequired }
-
-        try await producer(kind).revokeGrant(grant.metadata.grantID)
-        do {
-            _ = try await consumer.listTools()
-            throw LocalMCPError.commandFailed
-        } catch let error as LocalMCPError where error == .grantRevoked || error == .unauthorized {
-            grants.removeValue(forKey: kind)
-            states[kind]?.status = .revoked
-            appendEvent("Revoked \(kind.displayName)'s grant; the other producer remains paired.")
-            return makeSnapshot()
+            try await producer(kind).revokeGrant(grant.metadata.grantID)
+            do {
+                _ = try await consumer.listTools()
+                throw LocalMCPError.commandFailed
+            } catch let error as LocalMCPError where error == .grantRevoked || error == .unauthorized {
+                grants.removeValue(forKey: kind)
+                states[kind]?.status = .revoked
+                appendEvent("Revoked \(kind.displayName)'s grant; the other producer remains paired.")
+                return makeSnapshot()
+            }
         }
     }
 
     @discardableResult
     public func stop() async -> TwoProducerDemoSnapshot {
-        await acquireOperation()
-        defer { releaseOperation() }
-        return await stopSerialized()
+        await withOperation {
+            await stopSerialized()
+        }
     }
 
     private func stopSerialized() async -> TwoProducerDemoSnapshot {
@@ -400,19 +404,18 @@ public actor TwoProducerDemo {
 
     @discardableResult
     public func reset() async throws -> TwoProducerDemoSnapshot {
-        await acquireOperation()
-        defer { releaseOperation() }
-
-        _ = await stopSerialized()
-        for counter in invocationCounters.values {
-            await counter.reset()
+        try await withOperation {
+            _ = await stopSerialized()
+            for counter in invocationCounters.values {
+                await counter.reset()
+            }
+            eventLog.removeAll(keepingCapacity: true)
+            for kind in DemoProducerKind.allCases {
+                states[kind]?.lastResult = nil
+                states[kind]?.invocationCount = 0
+            }
+            return try await startSerialized()
         }
-        eventLog.removeAll(keepingCapacity: true)
-        for kind in DemoProducerKind.allCases {
-            states[kind]?.lastResult = nil
-            states[kind]?.invocationCount = 0
-        }
-        return try await startSerialized()
     }
 
     public func snapshot() -> TwoProducerDemoSnapshot {
@@ -426,6 +429,20 @@ public actor TwoProducerDemo {
         }
         await withCheckedContinuation { continuation in
             operationWaiters.append(continuation)
+        }
+    }
+
+    private func withOperation<Result: Sendable>(
+        _ operation: () async throws -> Result
+    ) async rethrows -> Result {
+        await acquireOperation()
+        do {
+            let result = try await operation()
+            releaseOperation()
+            return result
+        } catch {
+            releaseOperation()
+            throw error
         }
     }
 

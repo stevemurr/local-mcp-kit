@@ -65,7 +65,7 @@ public struct LoopbackEndpoint: Codable, Sendable, Hashable {
               !value.contains("\\"),
               !value.contains("?"),
               !value.contains("#"),
-              !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+              !LocalMCPValidation.containsUnsafeTextScalar(value)
         else { return false }
 
         guard let decoded = value.removingPercentEncoding,
@@ -74,7 +74,7 @@ public struct LoopbackEndpoint: Codable, Sendable, Hashable {
               !decoded.contains("\\"),
               !decoded.contains("?"),
               !decoded.contains("#"),
-              !decoded.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+              !LocalMCPValidation.containsUnsafeTextScalar(decoded)
         else { return false }
         let components = decoded.split(separator: "/", omittingEmptySubsequences: false)
         return !components.contains(".") && !components.contains("..")
@@ -102,19 +102,23 @@ public struct ProducerInstance: Codable, Sendable, Hashable {
     public var endpoint: LoopbackEndpoint
     public var descriptorURL: LoopbackEndpoint
     public var compatibility: ProducerCompatibility
+    /// Present for discovered HTTP producers. In-memory transports may omit it.
+    public var channelBinding: ProducerChannelBinding?
 
     public init(
         identity: ProducerIdentity,
         instanceID: String,
         endpoint: LoopbackEndpoint,
         descriptorURL: LoopbackEndpoint,
-        compatibility: ProducerCompatibility = .compatible
+        compatibility: ProducerCompatibility = .compatible,
+        channelBinding: ProducerChannelBinding? = nil
     ) {
         self.identity = identity
         self.instanceID = instanceID
         self.endpoint = endpoint
         self.descriptorURL = descriptorURL
         self.compatibility = compatibility
+        self.channelBinding = channelBinding
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -123,6 +127,7 @@ public struct ProducerInstance: Codable, Sendable, Hashable {
         case endpoint
         case descriptorURL
         case compatibility
+        case channelBinding
     }
 }
 
@@ -133,10 +138,10 @@ public struct MCPDescriptor: Codable, Sendable, Hashable {
     public var authentication: String
 
     public init(
-        transport: String = "streamable-http",
+        transport: String = "localmcp-secure-http",
         endpoint: String = "/mcp",
         protocolVersions: [String] = [MCPProtocolVersion.current.rawValue],
-        authentication: String = "pairing"
+        authentication: String = "pairing-channel"
     ) {
         self.transport = transport
         self.endpoint = endpoint
@@ -160,19 +165,24 @@ public struct ProducerDescriptor: Codable, Sendable, Hashable {
     public var server: ProducerIdentity
     public var mcp: MCPDescriptor
     public var capabilities: ProducerCapabilities
+    /// Optional in the model so an old or malformed descriptor can be decoded
+    /// and reported as incompatible. V1 compatibility requires this value.
+    public var channelBinding: ProducerChannelBinding?
 
     public init(
         schemaVersion: String = DiscoveryProfileVersion.current.rawValue,
         instanceID: String,
         server: ProducerIdentity,
         mcp: MCPDescriptor = MCPDescriptor(),
-        capabilities: ProducerCapabilities = ProducerCapabilities()
+        capabilities: ProducerCapabilities = ProducerCapabilities(),
+        channelBinding: ProducerChannelBinding? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.instanceID = instanceID
         self.server = server
         self.mcp = mcp
         self.capabilities = capabilities
+        self.channelBinding = channelBinding
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -181,6 +191,7 @@ public struct ProducerDescriptor: Codable, Sendable, Hashable {
         case server
         case mcp
         case capabilities
+        case channelBinding
     }
 }
 
@@ -210,15 +221,17 @@ public enum DescriptorCompatibility {
         guard descriptor.schemaVersion == DiscoveryProfileVersion.current.rawValue else {
             throw LocalMCPError.incompatibleDiscoveryProfile
         }
-        guard descriptor.mcp.transport == "streamable-http",
-              descriptor.mcp.authentication == "pairing",
+        guard descriptor.mcp.transport == "localmcp-secure-http",
+              descriptor.mcp.authentication == "pairing-channel",
               descriptor.mcp.endpoint == "/mcp",
               LocalMCPValidation.isCanonicalLowercaseUUID(descriptor.instanceID),
               descriptor.server.isValid,
               descriptor.capabilities.tools,
               !descriptor.mcp.protocolVersions.isEmpty,
               Set(descriptor.mcp.protocolVersions).count == descriptor.mcp.protocolVersions.count,
-              descriptor.mcp.protocolVersions.allSatisfy({ !$0.isEmpty })
+              descriptor.mcp.protocolVersions.allSatisfy({ !$0.isEmpty }),
+              let channelBinding = descriptor.channelBinding,
+              channelBinding.isSupported
         else {
             throw LocalMCPError.incompatibleDiscoveryProfile
         }
@@ -251,7 +264,7 @@ public struct DiscoveryAdvertisement: Sendable, Hashable {
         stableProducerID: String,
         endpointPath: String = "/mcp",
         descriptorPath: String = "/local-mcp/v1/descriptor.json",
-        authentication: String = "pair"
+        authentication: String = "pair-channel"
     ) {
         self.profileVersion = profileVersion
         self.stableProducerID = stableProducerID
@@ -277,7 +290,7 @@ public struct DiscoveryAdvertisement: Sendable, Hashable {
               let descriptorPath = txtValues["desc"],
               let auth = txtValues["auth"],
               version == DiscoveryProfileVersion.current.rawValue,
-              auth == "pair",
+              auth == "pair-channel",
               LocalMCPValidation.isStableID(id),
               path == "/mcp",
               descriptorPath == "/local-mcp/v1/descriptor.json"
@@ -312,12 +325,22 @@ public enum LocalMCPValidation {
     public static func isDisplayName(_ value: String) -> Bool {
         !value.isEmpty &&
             value.unicodeScalars.count <= 128 &&
-            !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+            !containsUnsafeTextScalar(value)
     }
 
     public static func isVersion(_ value: String) -> Bool {
         !value.isEmpty && value.unicodeScalars.count <= 64 &&
-            !value.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
+            !containsUnsafeTextScalar(value)
+    }
+
+    /// Rejects controls plus the Unicode line/paragraph separators, which are
+    /// not members of Foundation's `controlCharacters` set but can still alter
+    /// the layout of security-sensitive prompts and diagnostic text.
+    static func containsUnsafeTextScalar(_ value: String) -> Bool {
+        value.unicodeScalars.contains { scalar in
+            CharacterSet.controlCharacters.contains(scalar) ||
+                scalar.value == 0x2028 || scalar.value == 0x2029
+        }
     }
 
     public static func isCanonicalLowercaseUUID(_ value: String) -> Bool {

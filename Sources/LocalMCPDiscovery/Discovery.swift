@@ -27,17 +27,43 @@ public actor DiscoveryCatalog: LocalMCPAdvertising, LocalMCPBrowsing {
     public init() {}
 
     public func advertise(instance: ProducerInstance, descriptor: ProducerDescriptor) async throws {
+        try advertise(instance: instance, descriptor: descriptor, permitsUnboundInProcess: false)
+    }
+
+    /// Publishes a directly injected, same-process test service. This bypass is
+    /// intentionally separate from `LocalMCPAdvertising`: network discovery
+    /// backends can never use it to make a missing channel binding compatible.
+    public func advertiseInProcess(
+        instance: ProducerInstance,
+        descriptor: ProducerDescriptor
+    ) async throws {
+        guard instance.channelBinding == nil, descriptor.channelBinding == nil else {
+            throw LocalMCPError.invalidConfiguration
+        }
+        try advertise(instance: instance, descriptor: descriptor, permitsUnboundInProcess: true)
+    }
+
+    private func advertise(
+        instance: ProducerInstance,
+        descriptor: ProducerDescriptor,
+        permitsUnboundInProcess: Bool
+    ) throws {
         var resolved = instance
         if descriptor.instanceID != instance.instanceID ||
             descriptor.server != instance.identity ||
             descriptor.mcp.endpoint != instance.endpoint.path ||
+            descriptor.channelBinding != instance.channelBinding ||
             instance.endpoint.port != instance.descriptorURL.port ||
             instance.descriptorURL.path != "/local-mcp/v1/descriptor.json"
         {
             resolved.compatibility = .incompatibleDiscoveryProfile(descriptor.schemaVersion)
         } else {
             do {
-                _ = try DescriptorCompatibility.validate(descriptor)
+                var validatedDescriptor = descriptor
+                if permitsUnboundInProcess {
+                    validatedDescriptor.channelBinding = Self.inProcessValidationBinding
+                }
+                _ = try DescriptorCompatibility.validate(validatedDescriptor)
                 resolved.compatibility = .compatible
             } catch LocalMCPError.incompatibleMCPProtocol {
                 resolved.compatibility = .incompatibleMCPProtocol(descriptor.mcp.protocolVersions)
@@ -62,6 +88,10 @@ public actor DiscoveryCatalog: LocalMCPAdvertising, LocalMCPBrowsing {
             broadcast(.added(resolved))
         }
     }
+
+    private static let inProcessValidationBinding = ProducerChannelBinding(
+        publicKey: try! ChannelBindingPublicKey(rawRepresentation: Array(repeating: 0x42, count: 32))
+    )
 
     public func withdraw(instanceID: String) async {
         guard entries.removeValue(forKey: instanceID) != nil else { return }

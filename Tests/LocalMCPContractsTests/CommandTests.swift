@@ -16,8 +16,8 @@ struct CommandDefinitionTests {
         let defaults = CommandAnnotations()
         #expect(!defaults.readOnly)
         #expect(!defaults.idempotent)
-        #expect(!defaults.destructive)
-        #expect(!defaults.openWorld)
+        #expect(defaults.destructive)
+        #expect(defaults.openWorld)
 
         let annotations = CommandAnnotations(
             readOnly: true,
@@ -92,6 +92,8 @@ struct CommandDefinitionTests {
         for description in [
             "",
             " \n\t ",
+            "Safe\u{2028}spoofed",
+            "Safe\u{2029}spoofed",
             String(repeating: "d", count: 1_025),
         ] {
             let definition = CommandDefinition(
@@ -105,6 +107,8 @@ struct CommandDefinitionTests {
         for title in [
             "",
             " \n\t ",
+            "Safe\u{2028}spoofed",
+            "Safe\u{2029}spoofed",
             String(repeating: "t", count: 257),
         ] {
             let definition = CommandDefinition(
@@ -144,9 +148,26 @@ struct CommandDefinitionTests {
             name: "object-output",
             description: "Description",
             inputSchema: objectSchema,
-            outputSchema: .object([:])
+            outputSchema: .object(["type": .string("object")])
         )
         #expect(objectOutput.isValid)
+
+        for schemaWithoutObjectType in [
+            JSONValue.object([:]),
+            .object(["type": .string("array")]),
+        ] {
+            #expect(!CommandDefinition(
+                name: "invalid-input-root-type",
+                description: "Description",
+                inputSchema: schemaWithoutObjectType
+            ).isValid)
+            #expect(!CommandDefinition(
+                name: "invalid-output-root-type",
+                description: "Description",
+                inputSchema: objectSchema,
+                outputSchema: schemaWithoutObjectType
+            ).isValid)
+        }
 
         for invalidOutput in [
             JSONValue.null,
@@ -198,6 +219,13 @@ struct CommandResultTests {
             from: JSONEncoder().encode(result)
         )
         #expect(roundTrip == result)
+
+        expectLocalMCPError(.commandFailed) {
+            _ = try CommandResult.structured(42)
+        }
+        expectLocalMCPError(.commandFailed) {
+            _ = try CommandResult.structured(["not", "an", "object"])
+        }
     }
 
     @Test("Text and failure factories set only their intended fields")
