@@ -88,11 +88,17 @@ public actor CommandRegistry {
                         try await sleeper.sleep(for: remaining)
                         throw LocalMCPError.requestTimedOut
                     }
-                    defer { group.cancelAll() }
-                    guard let first = try await group.next() else {
-                        throw LocalMCPError.commandFailed
+                    do {
+                        guard let first = try await group.next() else {
+                            group.cancelAll()
+                            throw LocalMCPError.commandFailed
+                        }
+                        group.cancelAll()
+                        return first
+                    } catch {
+                        group.cancelAll()
+                        throw error
                     }
-                    return first
                 }
             } else {
                 result = try await entry.handler(request.arguments, context)
