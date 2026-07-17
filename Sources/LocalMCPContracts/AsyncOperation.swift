@@ -115,7 +115,7 @@ private final class LocalMCPResultGate<Success: Sendable>: @unchecked Sendable {
         let result = await withCheckedContinuation {
             (continuation: CheckedContinuation<Result<Success, any Error>, Never>) in
             let completed = lock.withLock { () -> Result<Success, any Error>? in
-                if let result { return result }
+                if let existing = self.result { return existing }
                 waiters.append(continuation)
                 return nil
             }

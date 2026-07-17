@@ -508,7 +508,7 @@ private final class StartupGate: @unchecked Sendable {
     func wait() async throws -> UInt16 {
         try await withCheckedThrowingContinuation { continuation in
             let result = lock.withLock { () -> Result<UInt16, any Error>? in
-                if let result { return result }
+                if let existing = self.result { return existing }
                 self.continuation = continuation
                 return nil
             }
