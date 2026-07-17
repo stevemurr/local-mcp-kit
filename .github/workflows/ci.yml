@@ -34,4 +34,7 @@ jobs:
         run: swift build
 
       - name: Test
-        run: swift test
+        # The raw-socket integration suites block cooperative-pool threads
+        # while their peers answer; on the small hosted runners, running
+        # multiple such suites in parallel can exhaust the pool and deadlock.
+        run: swift test --no-parallel
