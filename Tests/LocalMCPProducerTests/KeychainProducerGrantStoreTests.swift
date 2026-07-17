@@ -298,13 +298,21 @@ struct KeychainProducerGrantStoreTests {
             account: String(repeating: "a", count: 64),
             accessGroup: "TEAMID.com.example.shared"
         )
-        let query = SystemProducerKeychainAccess.addQuery(scope: scope, data: Data([1, 2, 3]))
+        let query = SystemProducerKeychainAccess().addQuery(scope: scope, data: Data([1, 2, 3]))
 
         #expect(CFEqual(query[kSecAttrSynchronizable] as CFTypeRef?, kCFBooleanFalse))
         #expect(CFEqual(query[kSecAttrAccessible] as CFTypeRef?, kSecAttrAccessibleWhenUnlockedThisDeviceOnly))
         #expect(query[kSecAttrAccessGroup] as? String == scope.accessGroup)
         #expect(query[kSecAttrService] as? String == scope.service)
         #expect(query[kSecAttrAccount] as? String == scope.account)
+        // Default uses the legacy file-based keychain; the flag is absent.
+        #expect(query[kSecUseDataProtectionKeychain] == nil)
+
+        // Sandboxed apps opt into the data-protection keychain, which honors
+        // the keychain access group inside the sandbox.
+        let dataProtected = SystemProducerKeychainAccess(useDataProtectionKeychain: true)
+            .addQuery(scope: scope, data: Data([1, 2, 3]))
+        #expect(CFEqual(dataProtected[kSecUseDataProtectionKeychain] as CFTypeRef?, kCFBooleanTrue))
     }
 
     @Test("LocalMCPProducer exposes deterministic digest-only grant enumeration")

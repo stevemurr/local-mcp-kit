@@ -267,6 +267,14 @@ Real integrations use `KeychainProducerGrantStore` and `KeychainConsumerGrantSto
 
 If an app suite intentionally shares grants between its own signed components, pass an explicit access group that the host already entitles. LocalMCPKit does not infer or create one. Items are non-synchronizing and device-only; account migration or iCloud Keychain must not silently copy bearer grants to another Mac.
 
+**Sandboxed apps must set `useDataProtectionKeychain: true`** on the store configuration. The default legacy file-based (login) keychain does not honor a keychain access group inside the App Sandbox, so `SecItem` calls fail with `errSecMissingEntitlement` and grants cannot be stored — pairing then fails right after user approval. Enabling the data-protection keychain requires the app to be signed by a team (not ad-hoc) and to carry a `keychain-access-groups` entitlement, for example `$(AppIdentifierPrefix)com.example.app`. The default stays `false` so non-sandboxed hosts keep using the login keychain unchanged.
+
+```swift
+grantStore: try KeychainProducerGrantStore(
+    configuration: .init(useDataProtectionKeychain: true) // sandboxed apps
+)
+```
+
 For sandboxed production networking:
 
 - a producer app needs the macOS App Sandbox network-server entitlement;

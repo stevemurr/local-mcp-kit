@@ -282,13 +282,18 @@ struct KeychainConsumerGrantStoreTests {
             account: String(repeating: "a", count: 64),
             accessGroup: "TEAMID.com.example.shared"
         )
-        let query = SystemConsumerKeychainAccess.addQuery(scope: scope, data: Data([1, 2, 3]))
+        let query = SystemConsumerKeychainAccess().addQuery(scope: scope, data: Data([1, 2, 3]))
 
         #expect(CFEqual(query[kSecAttrSynchronizable] as CFTypeRef?, kCFBooleanFalse))
         #expect(CFEqual(query[kSecAttrAccessible] as CFTypeRef?, kSecAttrAccessibleWhenUnlockedThisDeviceOnly))
         #expect(query[kSecAttrAccessGroup] as? String == scope.accessGroup)
         #expect(query[kSecAttrService] as? String == scope.service)
         #expect(query[kSecAttrAccount] as? String == scope.account)
+        #expect(query[kSecUseDataProtectionKeychain] == nil)
+
+        let dataProtected = SystemConsumerKeychainAccess(useDataProtectionKeychain: true)
+            .addQuery(scope: scope, data: Data([1, 2, 3]))
+        #expect(CFEqual(dataProtected[kSecUseDataProtectionKeychain] as CFTypeRef?, kCFBooleanTrue))
     }
 
     @Test("Persisted stable-ID lookup never authorizes a replacement instance")

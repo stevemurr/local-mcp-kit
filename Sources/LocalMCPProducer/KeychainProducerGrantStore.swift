@@ -13,13 +13,21 @@ public actor KeychainProducerGrantStore: ProducerGrantStoring {
     public struct Configuration: Sendable, Hashable {
         public var service: String
         public var accessGroup: String?
+        /// Use the data-protection keychain instead of the legacy file-based
+        /// (login) keychain. Sandboxed apps MUST enable this: the file-based
+        /// keychain does not honor a keychain access group inside the sandbox,
+        /// so `SecItem` calls fail. Enabling it requires the app to carry a
+        /// `keychain-access-groups` entitlement (a team-derived group).
+        public var useDataProtectionKeychain: Bool
 
         public init(
             service: String = "LocalMCPKit.producer-grants.v1",
-            accessGroup: String? = nil
+            accessGroup: String? = nil,
+            useDataProtectionKeychain: Bool = false
         ) {
             self.service = service
             self.accessGroup = accessGroup
+            self.useDataProtectionKeychain = useDataProtectionKeychain
         }
     }
 
@@ -31,7 +39,9 @@ public actor KeychainProducerGrantStore: ProducerGrantStoring {
             throw LocalMCPError.invalidConfiguration
         }
         self.configuration = configuration
-        keychain = SystemProducerKeychainAccess()
+        keychain = SystemProducerKeychainAccess(
+            useDataProtectionKeychain: configuration.useDataProtectionKeychain
+        )
     }
 
     init(
@@ -365,8 +375,14 @@ enum ProducerKeychainAccessError: Error, Sendable, Equatable {
 }
 
 struct SystemProducerKeychainAccess: ProducerKeychainAccess {
+    let useDataProtectionKeychain: Bool
+
+    init(useDataProtectionKeychain: Bool = false) {
+        self.useDataProtectionKeychain = useDataProtectionKeychain
+    }
+
     func readAll(service: String, accessGroup: String?) throws -> [Data] {
-        var query = Self.serviceQuery(service: service, accessGroup: accessGroup)
+        var query = serviceQuery(service: service, accessGroup: accessGroup)
         query[kSecReturnData] = kCFBooleanTrue
         query[kSecMatchLimit] = kSecMatchLimitAll
         var result: CFTypeRef?
@@ -381,7 +397,7 @@ struct SystemProducerKeychainAccess: ProducerKeychainAccess {
     }
 
     func upsert(scope: ProducerKeychainScope, data: Data) throws {
-        let add = Self.addQuery(scope: scope, data: data)
+        let add = addQuery(scope: scope, data: data)
         let addStatus = SecItemAdd(add as CFDictionary, nil)
         if addStatus == errSecSuccess { return }
         guard addStatus == errSecDuplicateItem else {
@@ -390,7 +406,7 @@ struct SystemProducerKeychainAccess: ProducerKeychainAccess {
 
         let attributes: [CFString: Any] = [kSecValueData: data]
         let updateStatus = SecItemUpdate(
-            Self.baseQuery(scope: scope) as CFDictionary,
+            baseQuery(scope: scope) as CFDictionary,
             attributes as CFDictionary
         )
         guard updateStatus == errSecSuccess else {
@@ -399,31 +415,34 @@ struct SystemProducerKeychainAccess: ProducerKeychainAccess {
     }
 
     func delete(scope: ProducerKeychainScope) throws {
-        let status = SecItemDelete(Self.baseQuery(scope: scope) as CFDictionary)
+        let status = SecItemDelete(baseQuery(scope: scope) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw ProducerKeychainAccessError.status(status)
         }
     }
 
-    static func baseQuery(scope: ProducerKeychainScope) -> [CFString: Any] {
+    func baseQuery(scope: ProducerKeychainScope) -> [CFString: Any] {
         var query = serviceQuery(service: scope.service, accessGroup: scope.accessGroup)
         query[kSecAttrAccount] = scope.account
         return query
     }
 
-    static func serviceQuery(service: String, accessGroup: String?) -> [CFString: Any] {
+    func serviceQuery(service: String, accessGroup: String?) -> [CFString: Any] {
         var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrSynchronizable: kCFBooleanFalse as Any,
         ]
+        if useDataProtectionKeychain {
+            query[kSecUseDataProtectionKeychain] = kCFBooleanTrue as Any
+        }
         if let accessGroup {
             query[kSecAttrAccessGroup] = accessGroup
         }
         return query
     }
 
-    static func addQuery(scope: ProducerKeychainScope, data: Data) -> [CFString: Any] {
+    func addQuery(scope: ProducerKeychainScope, data: Data) -> [CFString: Any] {
         var query = baseQuery(scope: scope)
         query[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         query[kSecValueData] = data
