@@ -2,9 +2,8 @@
 
 import PackageDescription
 
-let strictConcurrencySettings: [SwiftSetting] = [
-    .enableUpcomingFeature("StrictConcurrency"),
-]
+// Swift 6 language mode enables complete strict-concurrency checking by default.
+let strictConcurrencySettings: [SwiftSetting] = []
 
 let package = Package(
     name: "LocalMCPKit",
