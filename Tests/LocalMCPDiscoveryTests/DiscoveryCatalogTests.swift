@@ -519,12 +519,7 @@ struct DiscoveryCatalogTests {
         let secondStream = await catalog.events()
         #expect(await catalog.subscriberCount() == 2)
 
-        let firstConsumer = Task { () -> DiscoveryEvent? in
-            var iterator = firstStream.makeAsyncIterator()
-            return await iterator.next()
-        }
-        firstConsumer.cancel()
-        let firstResult = await firstConsumer.value
+        let firstResult = await cancelledIterationResult(of: firstStream)
         #expect(firstResult == nil)
 
         let countAfterFirstCancellation = await subscriberCount(
@@ -533,16 +528,42 @@ struct DiscoveryCatalogTests {
         )
         #expect(countAfterFirstCancellation == 1)
 
-        let secondConsumer = Task { () -> DiscoveryEvent? in
-            var iterator = secondStream.makeAsyncIterator()
-            return await iterator.next()
-        }
-        secondConsumer.cancel()
-        let secondResult = await secondConsumer.value
+        let secondResult = await cancelledIterationResult(of: secondStream)
         #expect(secondResult == nil)
 
         let finalCount = await subscriberCount(0, eventuallyIn: catalog)
         #expect(finalCount == 0)
+    }
+
+    /// Cancels a consumer only after it has begun iterating, and bounds the
+    /// join so a stream that ignores cancellation fails the test instead of
+    /// wedging the whole run.
+    private func cancelledIterationResult(
+        of stream: AsyncStream<DiscoveryEvent>
+    ) async -> DiscoveryEvent? {
+        struct IterationTimeout: Error {}
+        let gate = IterationStartGate()
+        let consumer = Task { () -> DiscoveryEvent? in
+            var iterator = stream.makeAsyncIterator()
+            await gate.markStarted()
+            return await iterator.next()
+        }
+        await gate.waitUntilStarted()
+        await Task.yield()
+        consumer.cancel()
+
+        let join = LocalMCPAsyncOperation<DiscoveryEvent?>(
+            timeoutAfter: 10,
+            timeoutError: IterationTimeout()
+        ) {
+            await consumer.value
+        }
+        do {
+            return try await join.value(cancellationError: IterationTimeout())
+        } catch {
+            Issue.record("A cancelled subscriber iteration never returned.")
+            return nil
+        }
     }
 
     private func subscriberCount(
@@ -630,5 +651,22 @@ private enum DiscoveryFixture {
             version: version,
             port: port
         )
+    }
+}
+
+private actor IterationStartGate {
+    private var started = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func markStarted() {
+        started = true
+        let current = waiters
+        waiters.removeAll()
+        for waiter in current { waiter.resume() }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { waiters.append($0) }
     }
 }
