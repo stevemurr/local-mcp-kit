@@ -608,9 +608,10 @@ struct BonjourLocalOnlyBrowsingTests {
         #expect(await eventually { await discovery.snapshot().count == 1 })
         #expect(await eventually { await recorder.events().count == 3 })
         let events = await recorder.events()
-        #expect(events[0] == .added(try bonjourTestInstance()))
+        let expectedInstance = try bonjourTestInstance()
+        #expect(events[0] == .added(expectedInstance))
         #expect(events[1] == .removed(instanceID: bonjourTestInstanceID))
-        #expect(events[2] == .added(try bonjourTestInstance()))
+        #expect(events[2] == .added(expectedInstance))
 
         await discovery.stop()
         observation.cancel()
