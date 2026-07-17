@@ -1,7 +1,14 @@
 import Foundation
 import Testing
 
-@Suite("Separate-process HTTP example", .serialized)
+// The spawned producer advertises over the real system Bonjour daemon and the
+// diagnostic CLI must rediscover it; hosted CI runners restrict mDNSResponder,
+// so this suite runs only outside CI environments.
+@Suite(
+    "Separate-process HTTP example",
+    .serialized,
+    .enabled(if: ProcessInfo.processInfo.environment["CI"] == nil)
+)
 struct SeparateProcessIntegrationTests {
     @Test("Producer and consumer complete an authenticated MCP call in distinct processes")
     func producerConsumerFlow() async throws {

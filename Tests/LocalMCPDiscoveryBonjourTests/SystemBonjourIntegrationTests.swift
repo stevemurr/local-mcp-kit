@@ -3,7 +3,14 @@ import LocalMCPContracts
 import Testing
 @testable import LocalMCPDiscoveryBonjour
 
-@Suite("System Bonjour LocalOnly integration", .serialized)
+// Hosted CI runners restrict mDNSResponder, so a real registration callback
+// may never arrive there. The suite requires a real local Bonjour daemon and
+// therefore runs only outside CI environments.
+@Suite(
+    "System Bonjour LocalOnly integration",
+    .serialized,
+    .enabled(if: ProcessInfo.processInfo.environment["CI"] == nil)
+)
 struct SystemBonjourIntegrationTests {
     @Test("A real LocalOnly registration is visible to a real LocalOnly browser")
     func registerAndBrowse() async throws {
@@ -51,19 +58,14 @@ struct SystemBonjourIntegrationTests {
         _ backend: SystemBonjourDNSServiceBackend,
         request: BonjourRegistrationRequest
     ) async throws -> any BonjourDNSServiceOperation {
-        try await withThrowingTaskGroup(of: (any BonjourDNSServiceOperation).self) { group in
-            group.addTask {
-                try await backend.register(request) { _ in }
-            }
-            group.addTask {
-                try await Task.sleep(for: .seconds(5))
-                throw Timeout.registration
-            }
-            guard let operation = try await group.next() else {
-                throw Timeout.registration
-            }
-            group.cancelAll()
-            return operation
+        // The timeout must not join a registration whose daemon callback
+        // never arrives; a task group would await the hung child forever.
+        let operation = LocalMCPAsyncOperation<any BonjourDNSServiceOperation>(
+            timeoutAfter: 5,
+            timeoutError: Timeout.registration
+        ) {
+            try await backend.register(request) { _ in }
         }
+        return try await operation.value(cancellationError: Timeout.registration)
     }
 }
