@@ -135,7 +135,15 @@ private func withHTTPFixture(
 // The raw-socket fixture performs blocking POSIX reads. Running dozens of
 // these tests concurrently can exhaust the cooperative executor and deadlock
 // the test process before peers are scheduled to answer those reads.
-@Suite("Authenticated loopback HTTP and MCP wire", .serialized)
+//
+// Hosted CI runners wedge the Network.framework loopback listener before it
+// serves its first request, so the real-listener suite runs only outside CI
+// environments (locally and in the VM workflow).
+@Suite(
+    "Authenticated loopback HTTP and MCP wire",
+    .serialized,
+    .enabled(if: ProcessInfo.processInfo.environment["CI"] == nil)
+)
 struct HTTPTransportIntegrationTests {
     @Test("pair → initialize → initialized → list → call runs over a real ephemeral socket")
     func completeNetworkLifecycle() async throws {

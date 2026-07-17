@@ -136,7 +136,14 @@ private struct SecureRuntimeServiceStub: LocalMCPService {
     }
 }
 
-@Suite("Secure process-bound HTTP runtime", .serialized)
+// Hosted CI runners wedge the Network.framework loopback listener before it
+// serves its first request, so the real-listener suite runs only outside CI
+// environments (locally and in the VM workflow).
+@Suite(
+    "Secure process-bound HTTP runtime",
+    .serialized,
+    .enabled(if: ProcessInfo.processInfo.environment["CI"] == nil)
+)
 struct SecureRuntimeSecurityTests {
     @Test("process binding preparation is idempotent within an epoch and rotates after stop")
     func processBindingEpochs() async throws {

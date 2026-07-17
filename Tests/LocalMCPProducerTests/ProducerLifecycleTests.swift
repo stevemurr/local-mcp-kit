@@ -444,7 +444,15 @@ struct ProducerLifecycleTests {
         await stopping.value
         #expect(await producer.state == .stopped)
         #expect(await catalog.snapshot().isEmpty)
-        #expect(await directory.serviceCount() == 0)
+
+        // Late-acquired listener resources converge in a detached cleanup that
+        // stop() deliberately does not join; wait for it with a bound.
+        var remainingServices = await directory.serviceCount()
+        for _ in 0..<200 where remainingServices != 0 {
+            try await Task.sleep(for: .milliseconds(10))
+            remainingServices = await directory.serviceCount()
+        }
+        #expect(remainingServices == 0)
 
         try await producer.start()
         #expect(await directory.serviceCount() == 1)
