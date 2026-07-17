@@ -39,7 +39,7 @@ jobs:
   test:
     name: Test (default toolchain)
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Check out repository
@@ -51,12 +51,42 @@ jobs:
       - name: Build
         run: swift build --build-tests
 
-      - name: Test
-        # The raw-socket integration suites block cooperative-pool threads
-        # while their peers answer; on the small hosted runners, running
-        # multiple such suites in parallel can exhaust the pool and deadlock.
-        # The Swift 6.0 toolchain's runtime additionally wedges joining
-        # unstructured tasks on these runners, so behavioral coverage runs on
-        # the runner's default toolchain while the 6.0 job proves the floor
-        # still compiles in both configurations.
-        run: swift test --no-parallel
+      # Each target runs serially in its own bounded step: the raw-socket
+      # suites block cooperative-pool threads while their peers answer, and
+      # the hosted runners have wedged whole unbounded invocations. A wedged
+      # target times out without hiding the results of the others.
+      - name: Test LocalMCPContractsTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPContractsTests
+
+      - name: Test LocalMCPDiscoveryTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPDiscoveryTests
+
+      - name: Test LocalMCPDiscoveryBonjourTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPDiscoveryBonjourTests
+
+      - name: Test LocalMCPProducerTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPProducerTests
+
+      - name: Test LocalMCPConsumerTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPConsumerTests
+
+      - name: Test LocalMCPIntegrationTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPIntegrationTests
+
+      - name: Test LocalMCPTwoProducerExampleTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPTwoProducerExampleTests
+
+      - name: Test LocalMCPCommandTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPCommandTests
+
+      - name: Test LocalMCPSeparateProcessTests
+        if: ${{ !cancelled() }}
+        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPSeparateProcessTests
