@@ -492,7 +492,7 @@ private func readMockRequest(_ connection: Int32) throws -> Data {
         if bodyStart == nil, let range = data.range(of: Data("\r\n\r\n".utf8)) {
             bodyStart = range.upperBound
             let head = String(decoding: data[..<range.lowerBound], as: UTF8.self)
-            expectedLength = head.components(separatedBy: "\r\n").compactMap { line in
+            expectedLength = head.components(separatedBy: "\r\n").compactMap { line -> Int? in
                 let parts = line.split(separator: ":", maxSplits: 1)
                 guard parts.count == 2,
                       parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "content-length"
