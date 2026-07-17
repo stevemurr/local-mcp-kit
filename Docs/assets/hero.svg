@@ -1,0 +1,95 @@
+<svg width="1280" height="420" viewBox="0 0 1280 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="420" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0A0F1E"/>
+      <stop offset="0.55" stop-color="#0B1424"/>
+      <stop offset="1" stop-color="#0D1A2E"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse"
+      gradientTransform="translate(940 210) rotate(90) scale(230 340)">
+      <stop offset="0" stop-color="#1E5A6E" stop-opacity="0.55"/>
+      <stop offset="0.5" stop-color="#153A52" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#0D1A2E" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4FE3C6"/>
+      <stop offset="1" stop-color="#5E8CFF"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#13223A"/>
+      <stop offset="1" stop-color="#0E1A2D"/>
+    </linearGradient>
+    <linearGradient id="channel" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4FE3C6"/>
+      <stop offset="1" stop-color="#5E8CFF"/>
+    </linearGradient>
+    <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
+      <circle cx="1.4" cy="1.4" r="1.4" fill="#25406B" fill-opacity="0.35"/>
+    </pattern>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="420" rx="0" fill="url(#bg)"/>
+  <rect width="1280" height="420" fill="url(#dots)"/>
+  <rect width="1280" height="420" fill="url(#glow)"/>
+  <rect x="0.5" y="0.5" width="1279" height="419" rx="0" fill="none" stroke="#1C3352" stroke-opacity="0.5"/>
+
+  <!-- Wordmark -->
+  <text x="88" y="176" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="700" font-size="78" letter-spacing="-1.5">
+    <tspan fill="#F3F7FC">Local</tspan><tspan fill="url(#accent)">MCP</tspan><tspan fill="#F3F7FC">Kit</tspan>
+  </text>
+
+  <!-- Taglines -->
+  <text x="92" y="222" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="500" font-size="24" fill="#A9BFD4">Secure, local-only MCP for macOS apps</text>
+  <text x="92" y="256" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="400" font-size="17" fill="#6F869E">Encrypted loopback · channel-bound pairing · zero dependencies</text>
+
+  <!-- Tech ribbon -->
+  <g font-family="Menlo, monospace" font-size="14.5" letter-spacing="0.4">
+    <text x="92" y="356" fill="#7FE9D2">localmcp-secure-http</text>
+    <text x="286" y="356" fill="#425A78">·</text>
+    <text x="304" y="356" fill="#8FA6BE">X25519</text>
+    <text x="378" y="356" fill="#425A78">·</text>
+    <text x="396" y="356" fill="#8FA6BE">ChaCha20-Poly1305</text>
+    <text x="588" y="356" fill="#425A78">·</text>
+    <text x="606" y="356" fill="#8FA6BE">127.0.0.1</text>
+  </g>
+
+  <!-- Diagram: Producer / sealed channel / Consumer -->
+  <g>
+    <!-- Producer card -->
+    <rect x="694" y="150" width="150" height="120" rx="16" fill="url(#card)" stroke="#294870" stroke-width="1.5"/>
+    <rect x="714" y="176" width="46" height="10" rx="5" fill="#4FE3C6" fill-opacity="0.85"/>
+    <rect x="714" y="194" width="70" height="7" rx="3.5" fill="#3A5A82"/>
+    <rect x="714" y="208" width="58" height="7" rx="3.5" fill="#31507A"/>
+    <text x="714" y="248" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="600" font-size="17" fill="#EAF1F9">Producer</text>
+
+    <!-- Consumer card -->
+    <rect x="1036" y="150" width="150" height="120" rx="16" fill="url(#card)" stroke="#294870" stroke-width="1.5"/>
+    <rect x="1056" y="176" width="46" height="10" rx="5" fill="#5E8CFF" fill-opacity="0.85"/>
+    <rect x="1056" y="194" width="70" height="7" rx="3.5" fill="#3A5A82"/>
+    <rect x="1056" y="208" width="58" height="7" rx="3.5" fill="#31507A"/>
+    <text x="1056" y="248" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-weight="600" font-size="17" fill="#EAF1F9">Consumer</text>
+
+    <!-- Sealed channel -->
+    <line x1="844" y1="196" x2="1036" y2="196" stroke="#1E3960" stroke-width="10" stroke-linecap="round"/>
+    <line x1="844" y1="196" x2="1036" y2="196" stroke="url(#channel)" stroke-width="3" stroke-linecap="round" stroke-dasharray="2 9"/>
+    <text x="940" y="164" text-anchor="middle" font-family="Menlo, monospace" font-size="12.5" fill="#6E86A2">sealed · MCP 2025-11-25</text>
+
+    <!-- Padlock -->
+    <g transform="translate(940 196)">
+      <circle cx="0" cy="0" r="26" fill="#0C1A2E"/>
+      <circle cx="0" cy="0" r="26" fill="url(#accent)" fill-opacity="0.14" filter="url(#soft)"/>
+      <path d="M -9 -3 v -6 a 9 9 0 0 1 18 0 v 6" fill="none" stroke="url(#accent)" stroke-width="3.4" stroke-linecap="round"/>
+      <rect x="-13" y="-3" width="26" height="20" rx="5" fill="url(#accent)"/>
+      <circle cx="0" cy="6" r="2.6" fill="#0B1A2E"/>
+      <rect x="-1.3" y="6" width="2.6" height="6" rx="1.3" fill="#0B1A2E"/>
+    </g>
+
+    <!-- Loopback arc -->
+    <path d="M 1112 272 C 1112 330, 768 330, 768 272" fill="none" stroke="#31507A" stroke-width="2" stroke-dasharray="1 7" stroke-linecap="round"/>
+    <text x="940" y="322" text-anchor="middle" font-family="Menlo, monospace" font-size="12.5" fill="#5C7492">encrypted loopback · 127.0.0.1</text>
+  </g>
+</svg>
