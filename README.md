@@ -144,7 +144,7 @@ See the [integration guide](Docs/integration.md) for command schemas, lifecycle 
 | `LocalMCPDiscovery` | Replaying add/update/remove discovery state, independent of any backend. |
 | `LocalMCPDiscoveryBonjour` | Real DNS-SD registration, browsing, resolution, TXT handling, and bounded descriptor loading — all `kDNSServiceInterfaceIndexLocalOnly`. |
 | `LocalMCPProducer` | Typed command hosting, schema validation, secure HTTP transport, pairing, authorization, cancellation, deadlines, Keychain grants, and lifecycle. |
-| `LocalMCPConsumer` | Secure HTTP connector, explicit pairing, Keychain grants, and the negotiated client lifecycle. |
+| `LocalMCPConsumer` | Secure HTTP connector, explicit pairing, Keychain grants, and the negotiated client lifecycle with bounded per-operation deadlines. |
 | `LocalMCPTesting` | Deterministic in-memory transports, stores, discovery, approvers, clocks, and random sources. |
 | `local-mcp` | Read-only discovery and descriptor diagnostic CLI. |
 

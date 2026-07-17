@@ -99,19 +99,24 @@ public actor LocalMCPConsumer {
     }
 
     /// Begins explicit pairing. The callback lets consumer UI display the same
-    /// short code as the producer approval prompt.
+    /// short code as the producer approval prompt. An optional wall-clock
+    /// deadline bounds the whole flow, including the approval wait; expiry
+    /// releases the caller with `requestTimedOut` and a later `pair` may retry.
     @discardableResult
     public func pair(
-        displayVerificationCode: (@Sendable (PairingVerificationCode) -> Void)? = nil
+        displayVerificationCode: (@Sendable (PairingVerificationCode) -> Void)? = nil,
+        deadline: Date? = nil
     ) async throws -> AuthorizationGrant {
         guard pairingToken == nil else { throw LocalMCPError.pairingDenied }
         let token = UUID()
         pairingToken = token
 
         do {
-            let grant = try await completePairing(
-                displayVerificationCode: displayVerificationCode
-            )
+            let grant = try await withDeadline(deadline) {
+                try await self.completePairing(
+                    displayVerificationCode: displayVerificationCode
+                )
+            }
             clearPairing(token)
             return grant
         } catch {
@@ -261,13 +266,37 @@ public actor LocalMCPConsumer {
     /// Performs initialize and the required initialized notification on one
     /// cached connection. An explicit grant is an authority-bearing operation;
     /// callers must provision or authenticate the target before supplying it.
-    public func initialize(grant explicitGrant: AuthorizationGrant? = nil) async throws -> LocalMCPInitialization {
+    /// A wall-clock deadline releases the caller with `requestTimedOut` on
+    /// expiry; a coalesced negotiation survives for its remaining waiters.
+    public func initialize(
+        grant explicitGrant: AuthorizationGrant? = nil,
+        deadline: Date? = nil
+    ) async throws -> LocalMCPInitialization {
+        try await withDeadline(deadline) {
+            try await self.completeInitialize(grant: explicitGrant)
+        }
+    }
+
+    private func completeInitialize(
+        grant explicitGrant: AuthorizationGrant?
+    ) async throws -> LocalMCPInitialization {
         let target = try currentTarget()
         let grant = try await usableGrant(explicitGrant, for: target)
         return try await negotiateIfNeeded(grant: grant, target: target)
     }
 
-    public func listTools(grant explicitGrant: AuthorizationGrant? = nil) async throws -> [CommandDefinition] {
+    public func listTools(
+        grant explicitGrant: AuthorizationGrant? = nil,
+        deadline: Date? = nil
+    ) async throws -> [CommandDefinition] {
+        try await withDeadline(deadline) {
+            try await self.completeListTools(grant: explicitGrant)
+        }
+    }
+
+    private func completeListTools(
+        grant explicitGrant: AuthorizationGrant?
+    ) async throws -> [CommandDefinition] {
         let target = try currentTarget()
         let grant = try await usableGrant(explicitGrant, for: target)
         var service = try await initializedService(grant: grant, target: target)
@@ -295,6 +324,22 @@ public actor LocalMCPConsumer {
         arguments: JSONValue,
         grant explicitGrant: AuthorizationGrant? = nil,
         deadline: Date? = nil
+    ) async throws -> CommandResult {
+        try await withDeadline(deadline) {
+            try await self.completeCall(
+                name,
+                arguments: arguments,
+                grant: explicitGrant,
+                deadline: deadline
+            )
+        }
+    }
+
+    private func completeCall(
+        _ name: String,
+        arguments: JSONValue,
+        grant explicitGrant: AuthorizationGrant?,
+        deadline: Date?
     ) async throws -> CommandResult {
         let target = try currentTarget()
         let grant = try await usableGrant(explicitGrant, for: target)
@@ -636,6 +681,33 @@ public actor LocalMCPConsumer {
 
     private func clearPairing(_ token: UUID) {
         if pairingToken == token { pairingToken = nil }
+    }
+
+    /// Wall-clock cap on the enforced race interval. It guards the nanosecond
+    /// conversion in `LocalMCPAsyncOperation(timeoutAfter:)` against extreme
+    /// deadlines such as `.distantFuture`; it is not a default operation
+    /// timeout.
+    private static let maxEnforcedDeadlineInterval: TimeInterval = 366 * 24 * 60 * 60
+
+    /// Consumer-level deadline enforcement. Deadlines are wall-clock, matching
+    /// `CommandCallRequest.deadline` at the transport; the injected
+    /// `LocalMCPClock` remains scoped to grant-expiry decisions. Expiry
+    /// releases the caller with `requestTimedOut` without joining a
+    /// noncooperative connector, service, or store; the losing operation is
+    /// cancelled and its late result discarded.
+    private func withDeadline<Success: Sendable>(
+        _ deadline: Date?,
+        operation body: @escaping @Sendable () async throws -> Success
+    ) async throws -> Success {
+        guard let deadline else { return try await body() }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw LocalMCPError.requestTimedOut }
+        let operation = LocalMCPAsyncOperation(
+            timeoutAfter: min(remaining, Self.maxEnforcedDeadlineInterval),
+            timeoutError: LocalMCPError.requestTimedOut,
+            operation: body
+        )
+        return try await operation.value(cancellationError: LocalMCPError.cancelled)
     }
 
     private func performTracked<Success: Sendable>(

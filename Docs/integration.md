@@ -249,6 +249,8 @@ The consumer must initialize MCP before normal operations, negotiate an exact pr
 
 If a cached MCP session has expired, `listTools` may perform one fresh negotiation and retry the read-only listing. `call` never replays a command automatically: it re-establishes the session for a later explicit call but returns the original lifecycle error to the current caller. This matters even when a tool advertises idempotence, because annotations are hints and a response may have been lost after the producer performed work.
 
+Pass a `deadline:` on UI-driven operations — `pair`, `initialize`, `listTools`, and `call` all accept one — so a wedged producer or network path surfaces as a timely `requestTimedOut` instead of an indefinitely suspended task. `requestTimedOut` is recoverable: the consumer stays usable and a later call (including a retried `pair`) may succeed.
+
 Close a producer-bound consumer when its feature, account, or app-owned dependency container is torn down:
 
 ```swift

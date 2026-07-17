@@ -132,6 +132,15 @@ replays after an ambiguous transport or lifecycle failure. Explicit `close()`,
 route replacement/removal, and successful re-pair cancel outstanding work and
 terminate the prior session within a fixed visible bound.
 
+Every public consumer operation — `pair`, `initialize`, `listTools`, and
+`call` — accepts an optional wall-clock `deadline`. Expiry releases the caller
+with `requestTimedOut` at the consumer boundary without joining a
+noncooperative connector, service, or store, so the bound holds for any
+injected transport, not only the HTTP connector's own per-request timeouts. A
+timed-out coalesced waiter does not tear down another waiter's negotiation;
+`call` additionally forwards the deadline to the producer for handler-side
+enforcement.
+
 The consumer does not decide which discovered producer to trust or which tools an LLM may see/call. Those are host-app policy decisions.
 
 #### LocalMCPTesting
@@ -284,7 +293,7 @@ The in-memory vertical slice proves the same architecture without network depend
 10. Stop the producer and observe removal/cleanup.
 11. Repeat with two consumers and prove revoking one grant does not affect the other.
 
-Unit tests also cover Codable compatibility, duplicate command registration, typed decode/encode failures, discovery transitions (including late and multiple subscribers), pairing denial/expiry/rotation, cancellation, deadline propagation, idempotent lifecycle, and cleanup at every injected startup failure point.
+Unit tests also cover Codable compatibility, duplicate command registration, typed decode/encode failures, discovery transitions (including late and multiple subscribers), pairing denial/expiry/rotation, cancellation, deadline propagation, consumer-side deadline enforcement against a never-returning connector or service, idempotent lifecycle, and cleanup at every injected startup failure point.
 
 ## Dependency and evolution policy
 

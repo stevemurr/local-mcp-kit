@@ -21,6 +21,36 @@ private func expectLocalError(
     }
 }
 
+private struct DeadlineWatchdogExpired: Error {}
+
+/// Bounds a driven operation even when the consumer fails to enforce its
+/// deadline; resolving does not join the hung operation, so the suite stays
+/// bounded (and CI-safe) while the invariant is violated.
+private func watchdogged<Success: Sendable>(
+    _ body: @escaping @Sendable () async throws -> Success
+) -> LocalMCPAsyncOperation<Success> {
+    LocalMCPAsyncOperation(
+        timeoutAfter: 2,
+        timeoutError: DeadlineWatchdogExpired(),
+        operation: body
+    )
+}
+
+private func expectRequestTimedOut<Success: Sendable>(
+    _ operation: LocalMCPAsyncOperation<Success>
+) async {
+    do {
+        _ = try await operation.value()
+        Issue.record("Expected requestTimedOut")
+    } catch let error as LocalMCPError {
+        #expect(error == .requestTimedOut)
+    } catch is DeadlineWatchdogExpired {
+        Issue.record("Operation was not bounded by its deadline")
+    } catch {
+        Issue.record("Unexpected error type: \(type(of: error))")
+    }
+}
+
 private let consumerIdentity = ConsumerIdentity(
     stableID: "com.example.assistant",
     displayName: "Assistant",
@@ -66,6 +96,16 @@ private func grant(
 private struct StaticConnector: LocalMCPConnecting {
     let service: any LocalMCPService
     func connect(to instance: ProducerInstance) async throws -> any LocalMCPService { service }
+}
+
+private struct HangingConnector: LocalMCPConnecting {
+    let gate: ConsumerTestGate
+    let service: any LocalMCPService
+
+    func connect(to instance: ProducerInstance) async throws -> any LocalMCPService {
+        await gate.arriveAndWait()
+        return service
+    }
 }
 
 private actor StubService: LocalMCPDisconnectingService {
@@ -192,13 +232,14 @@ private actor StubService: LocalMCPDisconnectingService {
 private func makeConsumer(
     instance: ProducerInstance,
     service: StubService,
+    connector: (any LocalMCPConnecting)? = nil,
     store: InMemoryConsumerGrantStore = InMemoryConsumerGrantStore(),
     random: any RandomBytesGenerating = SequenceRandomBytesGenerator()
 ) -> LocalMCPConsumer {
     LocalMCPConsumer(
         instance: instance,
         identity: consumerIdentity,
-        connector: StaticConnector(service: service),
+        connector: connector ?? StaticConnector(service: service),
         grantStore: store,
         clock: ManualLocalMCPClock(),
         random: random
@@ -729,6 +770,196 @@ struct LocalMCPConsumerTests {
         #expect(counts.initialize == 1)
         #expect(counts.initialized == 1)
         #expect(counts.disconnect == 0)
+    }
+
+    @Test("Deadlines bound every operation against a connector that never returns")
+    func deadlinesBoundEveryOperationAgainstHangingConnector() async throws {
+        let connectGate = ConsumerTestGate()
+        let service = StubService(pairingGrant: try grant(), result: .text("unused"))
+        let consumer = makeConsumer(
+            instance: try instance(),
+            service: service,
+            connector: HangingConnector(gate: connectGate, service: service)
+        )
+        let g = try grant()
+        let deadline = Date().addingTimeInterval(0.25)
+        let clock = ContinuousClock()
+        let start = clock.now
+
+        let first = watchdogged {
+            try await consumer.initialize(grant: g, deadline: deadline)
+        }
+        await connectGate.waitUntilArrived()
+        let coalesced = watchdogged {
+            try await consumer.initialize(grant: g, deadline: deadline)
+        }
+        let list = watchdogged {
+            try await consumer.listTools(grant: g, deadline: deadline)
+        }
+        let call = watchdogged {
+            try await consumer.call(
+                "echo",
+                arguments: .object([:]),
+                grant: g,
+                deadline: deadline
+            )
+        }
+        let pairing = watchdogged {
+            try await consumer.pair(deadline: deadline)
+        }
+
+        await expectRequestTimedOut(first)
+        await expectRequestTimedOut(coalesced)
+        await expectRequestTimedOut(list)
+        await expectRequestTimedOut(call)
+        await expectRequestTimedOut(pairing)
+        #expect(start.duration(to: clock.now) < .seconds(3))
+        await connectGate.release()
+    }
+
+    @Test("A deadline bounds a hanging initialize and abandons the sole waiter's negotiation")
+    func deadlineBoundsHangingInitializeAndAbandonsSoleWaiter() async throws {
+        let gate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("unused"),
+            initializeGate: gate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        let initialization = watchdogged {
+            try await consumer.initialize(deadline: Date().addingTimeInterval(0.25))
+        }
+        await gate.waitUntilArrived()
+        await expectRequestTimedOut(initialization)
+        #expect(start.duration(to: clock.now) < .seconds(3))
+
+        await gate.release()
+        #expect(await eventuallyConsumerTest {
+            await service.counts().disconnect == 1
+        })
+    }
+
+    @Test("A timed-out coalesced waiter preserves the surviving negotiation")
+    func timedOutWaiterPreservesSurvivingNegotiation() async throws {
+        let gate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("unused"),
+            initializeGate: gate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+
+        let first = Task { try await consumer.initialize() }
+        await gate.waitUntilArrived()
+        let second = watchdogged {
+            try await consumer.initialize(deadline: Date().addingTimeInterval(0.2))
+        }
+        for _ in 0 ..< 20 { await Task.yield() }
+
+        await expectRequestTimedOut(second)
+        #expect(await service.counts().disconnect == 0)
+
+        await gate.release()
+        #expect(try await first.value.server == producerIdentity)
+        let counts = await service.counts()
+        #expect(counts.initialize == 1)
+        #expect(counts.initialized == 1)
+        #expect(counts.disconnect == 0)
+    }
+
+    @Test("Deadlines bound hung list and call on an initialized session")
+    func deadlineBoundsHungListAndCall() async throws {
+        let listGate = ConsumerTestGate()
+        let callGate = ConsumerTestGate()
+        let service = StubService(
+            pairingGrant: try grant(),
+            result: .text("unused"),
+            listGate: listGate,
+            callGate: callGate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        _ = try await consumer.pair()
+        _ = try await consumer.initialize()
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        let list = watchdogged {
+            try await consumer.listTools(deadline: Date().addingTimeInterval(0.2))
+        }
+        let call = watchdogged {
+            try await consumer.call(
+                "echo",
+                arguments: .object([:]),
+                deadline: Date().addingTimeInterval(0.2)
+            )
+        }
+        await expectRequestTimedOut(list)
+        await expectRequestTimedOut(call)
+        #expect(start.duration(to: clock.now) < .seconds(3))
+        await listGate.release()
+        await callGate.release()
+    }
+
+    @Test("An already-expired deadline fails fast without reaching the service")
+    func expiredDeadlineFailsFastWithoutReachingService() async throws {
+        let service = StubService(pairingGrant: try grant(), result: .text("unused"))
+        let consumer = makeConsumer(instance: try instance(), service: service)
+        let g = try grant()
+        let past = Date().addingTimeInterval(-1)
+
+        await expectLocalError(.requestTimedOut) {
+            _ = try await consumer.initialize(grant: g, deadline: past)
+        }
+        await expectLocalError(.requestTimedOut) {
+            _ = try await consumer.listTools(grant: g, deadline: past)
+        }
+        await expectLocalError(.requestTimedOut) {
+            _ = try await consumer.call(
+                "echo",
+                arguments: .object([:]),
+                grant: g,
+                deadline: past
+            )
+        }
+        await expectLocalError(.requestTimedOut) {
+            _ = try await consumer.pair(deadline: past)
+        }
+        let counts = await service.counts()
+        #expect(counts.pair == 0)
+        #expect(counts.initialize == 0)
+        #expect(counts.initialized == 0)
+        #expect(counts.list == 0)
+        #expect(counts.call == 0)
+    }
+
+    @Test("A timed-out pair releases the single-flight token for retry")
+    func timedOutPairReleasesSingleFlightForRetry() async throws {
+        let gate = ConsumerTestGate()
+        let expectedGrant = try grant()
+        let service = StubService(
+            pairingGrant: expectedGrant,
+            result: .text("unused"),
+            pairingGate: gate
+        )
+        let consumer = makeConsumer(instance: try instance(), service: service)
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        let pairing = watchdogged {
+            try await consumer.pair(deadline: Date().addingTimeInterval(0.2))
+        }
+        await gate.waitUntilArrived()
+        await expectRequestTimedOut(pairing)
+        #expect(start.duration(to: clock.now) < .seconds(3))
+
+        await gate.release()
+        #expect(try await consumer.pair() == expectedGrant)
+        #expect(try await consumer.listTools().map(\.name) == ["echo"])
     }
 }
 
