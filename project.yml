@@ -1,0 +1,89 @@
+name: LocalMCPTwoProducerExample
+
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "27.0"
+
+packages:
+  LocalMCPKit:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    ENABLE_HARDENED_RUNTIME: NO
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+  LocalMCPTwoProducerExampleSupport:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Examples/TwoProducers/Sources/Support
+    dependencies:
+      - package: LocalMCPKit
+        product: LocalMCPContracts
+      - package: LocalMCPKit
+        product: LocalMCPDiscovery
+      - package: LocalMCPKit
+        product: LocalMCPProducer
+      - package: LocalMCPKit
+        product: LocalMCPConsumer
+      - package: LocalMCPKit
+        product: LocalMCPTesting
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stevemurr.LocalMCPTwoProducerExampleSupport
+        GENERATE_INFOPLIST_FILE: YES
+        SKIP_INSTALL: YES
+
+  LocalMCPTwoProducerExample:
+    type: application
+    platform: macOS
+    sources:
+      - path: Examples/TwoProducers/Sources/App
+    dependencies:
+      - target: LocalMCPTwoProducerExampleSupport
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.stevemurr.LocalMCPTwoProducerExample
+        PRODUCT_NAME: LocalMCP Two Producer Demo
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: LocalMCP Two Producer Demo
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+
+  LocalMCPTwoProducerExampleUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: Examples/TwoProducers/UITests
+    dependencies:
+      - target: LocalMCPTwoProducerExample
+    settings:
+      base:
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        PRODUCT_BUNDLE_IDENTIFIER: com.stevemurr.LocalMCPTwoProducerExampleUITests
+        TEST_TARGET_NAME: LocalMCPTwoProducerExample
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  LocalMCPTwoProducerExample:
+    build:
+      targets:
+        LocalMCPTwoProducerExampleSupport: all
+        LocalMCPTwoProducerExample: all
+
+  LocalMCPTwoProducerExampleUITests:
+    build:
+      targets:
+        LocalMCPTwoProducerExampleSupport: all
+        LocalMCPTwoProducerExample: all
+        LocalMCPTwoProducerExampleUITests: [test]
+    test:
+      targets:
+        - name: LocalMCPTwoProducerExampleUITests
