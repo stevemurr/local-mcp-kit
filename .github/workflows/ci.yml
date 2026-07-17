@@ -57,36 +57,36 @@ jobs:
       # target times out without hiding the results of the others.
       - name: Test LocalMCPContractsTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPContractsTests
+        run: Scripts/ci-test-target.sh LocalMCPContractsTests
 
       - name: Test LocalMCPDiscoveryTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPDiscoveryTests
+        run: Scripts/ci-test-target.sh LocalMCPDiscoveryTests
 
       - name: Test LocalMCPDiscoveryBonjourTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPDiscoveryBonjourTests
+        run: Scripts/ci-test-target.sh LocalMCPDiscoveryBonjourTests
 
       - name: Test LocalMCPProducerTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPProducerTests
+        run: Scripts/ci-test-target.sh LocalMCPProducerTests
 
       - name: Test LocalMCPConsumerTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPConsumerTests
+        run: Scripts/ci-test-target.sh LocalMCPConsumerTests
 
       - name: Test LocalMCPIntegrationTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPIntegrationTests
+        run: Scripts/ci-test-target.sh LocalMCPIntegrationTests
 
       - name: Test LocalMCPTwoProducerExampleTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPTwoProducerExampleTests
+        run: Scripts/ci-test-target.sh LocalMCPTwoProducerExampleTests
 
       - name: Test LocalMCPCommandTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPCommandTests
+        run: Scripts/ci-test-target.sh LocalMCPCommandTests
 
       - name: Test LocalMCPSeparateProcessTests
         if: ${{ !cancelled() }}
-        run: gtimeout -k 15 420 swift test --no-parallel --filter LocalMCPSeparateProcessTests
+        run: Scripts/ci-test-target.sh LocalMCPSeparateProcessTests
