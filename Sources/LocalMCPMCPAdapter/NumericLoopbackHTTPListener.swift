@@ -583,7 +583,7 @@ private final class HTTPOperationBox: @unchecked Sendable {
     func cancel() {
         let operation = lock.withLock { () -> LocalMCPAsyncOperation<MCPHTTPResponse>? in
             cancelled = true
-            return operation
+            return self.operation
         }
         operation?.cancel(with: NumericLoopbackHTTPListener.ListenerError.stopped)
     }
