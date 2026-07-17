@@ -10,8 +10,8 @@ permissions:
   contents: read
 
 jobs:
-  build-and-test:
-    name: Build and test
+  build-minimum-toolchain:
+    name: Build (Swift 6.0 floor)
     runs-on: macos-15
     timeout-minutes: 30
 
@@ -33,8 +33,30 @@ jobs:
       - name: Build
         run: swift build
 
+      - name: Build (release)
+        run: swift build -c release
+
+  test:
+    name: Test (default toolchain)
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Build
+        run: swift build --build-tests
+
       - name: Test
         # The raw-socket integration suites block cooperative-pool threads
         # while their peers answer; on the small hosted runners, running
         # multiple such suites in parallel can exhaust the pool and deadlock.
+        # The Swift 6.0 toolchain's runtime additionally wedges joining
+        # unstructured tasks on these runners, so behavioral coverage runs on
+        # the runner's default toolchain while the 6.0 job proves the floor
+        # still compiles in both configurations.
         run: swift test --no-parallel
